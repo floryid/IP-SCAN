@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import ipaddress
 import json
 import os
@@ -16,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from html.parser import HTMLParser
@@ -817,6 +819,7 @@ def _try_http_request(url: str, timeout_s: float) -> Tuple[int, str, Dict[str, s
         headers={
             "User-Agent": "IP-SCAN/1.0 (+terminal)",
             "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate",
         },
         method="GET",
     )
@@ -825,6 +828,20 @@ def _try_http_request(url: str, timeout_s: float) -> Tuple[int, str, Dict[str, s
         final_url = str(getattr(resp, "geturl", lambda: url)())
         headers = {str(k): str(v) for k, v in resp.headers.items()}
         body = resp.read(60_000)
+    enc = str(headers.get("Content-Encoding") or "").lower()
+    if "gzip" in enc:
+        try:
+            body = gzip.decompress(body)
+        except Exception:
+            pass
+    elif "deflate" in enc:
+        try:
+            body = zlib.decompress(body)
+        except Exception:
+            try:
+                body = zlib.decompress(body, -zlib.MAX_WBITS)
+            except Exception:
+                pass
     return status, final_url, headers, body
 
 
@@ -940,6 +957,7 @@ def _try_http_request_limited(url: str, timeout_s: float, max_bytes: int) -> Tup
         headers={
             "User-Agent": "IP-SCAN/1.0 (+terminal)",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
         },
         method="GET",
     )
@@ -948,6 +966,20 @@ def _try_http_request_limited(url: str, timeout_s: float, max_bytes: int) -> Tup
         final_url = str(getattr(resp, "geturl", lambda: url)())
         headers = {str(k): str(v) for k, v in resp.headers.items()}
         body = resp.read(max_bytes)
+    enc = str(headers.get("Content-Encoding") or "").lower()
+    if "gzip" in enc:
+        try:
+            body = gzip.decompress(body)
+        except Exception:
+            pass
+    elif "deflate" in enc:
+        try:
+            body = zlib.decompress(body)
+        except Exception:
+            try:
+                body = zlib.decompress(body, -zlib.MAX_WBITS)
+            except Exception:
+                pass
     return status, final_url, headers, body
 
 
@@ -975,6 +1007,7 @@ def http_crawl_params(
         q.append((nu, 0))
 
     all_params: Set[str] = set()
+    all_endpoints: Set[str] = set()
     urls_with_params: List[str] = []
     hidden_fields: List[Tuple[str, str]] = []
     pages_ok = 0
@@ -1006,6 +1039,15 @@ def http_crawl_params(
                     all_params.add(nn)
                     if len(all_params) >= int(params_limit):
                         break
+        eps = params.get("endpoints")
+        if isinstance(eps, list):
+            for e in eps[:400]:
+                ee = str(e or "").strip()
+                if not ee:
+                    continue
+                all_endpoints.add(ee)
+                if len(all_endpoints) >= 800:
+                    break
 
         h = params.get("hidden_fields")
         if isinstance(h, list):
@@ -1079,6 +1121,8 @@ def http_crawl_params(
         "param_names": sorted(all_params)[: int(params_limit)],
         "count_params": len(all_params),
         "urls_with_params": uniq_urls,
+        "endpoints": sorted(all_endpoints)[: min(200, len(all_endpoints))],
+        "count_endpoints": len(all_endpoints),
         "hidden_fields": uniq_hidden,
     }
 
@@ -1093,6 +1137,9 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
         pass
 
     urls_with_params: List[str] = []
+    seen_urls: Set[str] = set()
+    endpoints: List[str] = []
+    seen_endpoints: Set[str] = set()
     params: Set[str] = set()
 
     for u in parser.urls:
@@ -1107,10 +1154,16 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
             continue
         if parts.hostname and parts.hostname.lower() != same_host.lower():
             continue
+        if not parts.query:
+            ep = _crawl_normalize(full)
+            if ep and ep not in seen_endpoints:
+                seen_endpoints.add(ep)
+                endpoints.append(ep)
         pnames = _extract_param_names_from_url(full)
         if pnames:
             params |= pnames
-            if len(urls_with_params) < url_limit:
+            if full not in seen_urls and len(urls_with_params) < url_limit:
+                seen_urls.add(full)
                 urls_with_params.append(full)
         if len(params) >= param_limit and len(urls_with_params) >= url_limit:
             break
@@ -1155,10 +1208,16 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
                 continue
             if parts.hostname and parts.hostname.lower() != same_host.lower():
                 continue
+            if not parts.query:
+                ep = _crawl_normalize(full)
+                if ep and ep not in seen_endpoints:
+                    seen_endpoints.add(ep)
+                    endpoints.append(ep)
             pnames = _extract_param_names_from_url(full)
             if pnames:
                 params |= pnames
-                if len(urls_with_params) < url_limit:
+                if full not in seen_urls and len(urls_with_params) < url_limit:
+                    seen_urls.add(full)
                     urls_with_params.append(full)
             if len(params) >= param_limit and len(urls_with_params) >= url_limit:
                 break
@@ -1178,6 +1237,7 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
     return {
         "param_names": sorted(params)[:param_limit],
         "urls_with_params": urls_with_params[:url_limit],
+        "endpoints": endpoints[: max(10, min(200, url_limit * 2))],
         "form_fields": sorted(parser.form_fields)[: min(200, len(parser.form_fields))],
         "hidden_fields": hidden_pairs,
         "count_params": len(params),
@@ -1358,6 +1418,7 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
         if isinstance(params, dict):
             names = params.get("param_names")
             urls = params.get("urls_with_params")
+            eps = params.get("endpoints")
             hidden = params.get("hidden_fields")
             if isinstance(names, list) and names:
                 disp = ", ".join([term.cyan(n, bold=True) for n in names[:18]])
@@ -1393,6 +1454,16 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
                     if not su:
                         continue
                     print(f"      {term.bullet()} {term.link(_truncate_middle(su, max(60, width - 12)), su)}")
+            if isinstance(eps, list) and eps:
+                shown = []
+                for e in eps[:6]:
+                    se = str(e or "").strip()
+                    if not se:
+                        continue
+                    shown.append(term.link(_truncate_middle(se, max(55, width - 18)), se))
+                if shown:
+                    more = term.gray(f" +{max(0, len(eps) - len(shown))} lagi") if len(eps) > len(shown) else ""
+                    print(f"    {term.gray('paths:')} " + term.gray(", ").join(shown) + more)
         server = str(r.get("server") or "").strip()
         powered = str(r.get("powered_by") or "").strip()
         ctype = str(r.get("content_type") or "").strip()
@@ -1438,6 +1509,7 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
         pnames = crawl.get("param_names")
         urls = crawl.get("urls_with_params")
         hidden = crawl.get("hidden_fields")
+        eps = crawl.get("endpoints")
         if pages_ok or pages_err or pnames or urls or hidden:
             print("")
             print(term.tag("PARAMS", color="violet") + term.dim("  ") + term.gray(f"crawl {pages_ok} ok / {pages_err} err"))
@@ -1473,6 +1545,13 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
                     if not su:
                         continue
                     print(f"    {term.bullet()} {term.link(_truncate_middle(su, max(70, width - 10)), su)}")
+            if isinstance(eps, list) and eps:
+                print(f"  {term.bullet()} {term.gray('paths:')} {term.gray('contoh endpoint same-host')}")
+                for e in eps[: min(10, len(eps))]:
+                    se = str(e or "").strip()
+                    if not se:
+                        continue
+                    print(f"    {term.bullet()} {term.link(_truncate_middle(se, max(70, width - 10)), se)}")
 
 
 def geo_ip_api_com(ip: str, timeout_s: float) -> Optional[GeoResult]:
@@ -2528,9 +2607,41 @@ def run_scan(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    epilog = """Contoh pemakaian:
+  1) Interaktif (cukup ketik domain/IP):
+     python ip_scan.py
+
+  2) Scan domain (DNS + RELATED + GeoIP + RDAP auto untuk 1 domain):
+     python ip_scan.py example.com
+
+  3) Mode komplit (RDAP + CT subdomain + DNS-extra + HTTP/TLS + params + crawl + menu):
+     python ip_scan.py example.com --full --crawl --crawl-pages 30 --crawl-depth 2 --params-limit 300 --params-urls 60
+
+  4) Subdomain pasif dari Certificate Transparency (CT):
+     python ip_scan.py example.com --ct --ct-limit 600 --ct-resolve 250
+
+  5) Parameter discovery (pasif) + crawl ringan same-host:
+     python ip_scan.py example.com --params --crawl
+
+  6) Live map (marker real-time):
+     python ip_scan.py example.com --map
+     python ip_scan.py example.com --map --host 127.0.0.1 --port 8000
+
+  7) Scan dari file (1 target per baris):
+     python ip_scan.py -f targets.txt
+
+  8) Pilih DNS resolver & provider GeoIP:
+     python ip_scan.py example.com --dns 1.1.1.1,8.8.8.8 --provider ip-api
+
+  9) Matikan warna/link atau paksa tampil (untuk terminal tertentu):
+     python ip_scan.py example.com --no-color --no-links
+     python ip_scan.py example.com --force-color --force-links
+"""
     p = argparse.ArgumentParser(
         prog="ip_scan.py",
-        description="Scan domain/IP, resolve DNS, GeoIP lookup, dan tampilkan marker real-time di peta (Leaflet).",
+        description="Terminal recon toolkit: DNS lookup, subdomain (CT), GeoIP, RDAP/WHOIS, HTTP/TLS, params, crawl, dan live map.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=epilog,
     )
     p.add_argument("targets", nargs="*", help="Target domain/IP/URL/CIDR (contoh: example.com, 8.8.8.8, 1.1.1.0/24)")
     p.add_argument("-f", "--file", help="File berisi daftar target (satu per baris)")
@@ -2548,16 +2659,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-auto-rdap", action="store_true", help="Matikan auto-RDAP saat scan domain (default: aktif untuk 1 target domain)")
     p.add_argument("--dns-extra", action="store_true", help="Tambah cek DNS tambahan (DMARC/MTA-STS/TLS-RPT, dll)")
     p.add_argument("--http", action="store_true", help="Tambah recon HTTP (status, redirect, headers, title)")
-    p.add_argument("--params", action="store_true", help="Cari parameter secara pasif dari HTML (query params + nama field form) saat --http aktif")
+    p.add_argument("--params", action="store_true", help="Cari parameter pasif dari HTML/JS (query params + form/hidden fields). Otomatis mengaktifkan --http")
     p.add_argument("--params-limit", type=int, default=120, help="Batas jumlah parameter unik yang ditampilkan (default: 120)")
     p.add_argument("--params-urls", type=int, default=20, help="Batas jumlah URL contoh yang berisi parameter (default: 20)")
-    p.add_argument("--crawl", action="store_true", help="Crawl ringan same-host untuk mengumpulkan URL/parameter (pasif, GET saja)")
+    p.add_argument("--crawl", action="store_true", help="Crawl ringan same-host untuk kumpulkan endpoint/parameter (GET saja). Efektif bila dipakai bersama --params")
     p.add_argument("--crawl-pages", type=int, default=12, help="Batas halaman crawl (default: 12)")
     p.add_argument("--crawl-depth", type=int, default=1, help="Kedalaman crawl (default: 1)")
     p.add_argument("--crawl-bytes", type=int, default=250000, help="Batas byte per halaman crawl (default: 250000)")
     p.add_argument("--tls", action="store_true", help="Tambah recon TLS cert (butuh --http atau scan domain)")
     p.add_argument("--max-related", type=int, default=20, help="Batas host RELATED yang di-resolve (default: 20)")
-    p.add_argument("--full", action="store_true", help="Mode lengkap (setara: --rdap --menu)")
+    p.add_argument("--full", action="store_true", help="Mode komplit (rdap + ct + dns-extra + http/tls + params + crawl + menu)")
     p.add_argument("--no-color", action="store_true", help="Matikan warna output")
     p.add_argument("--no-links", action="store_true", help="Matikan link klik (OSC 8)")
     p.add_argument("--force-color", action="store_true", help="Paksa warna output meski bukan TTY")
