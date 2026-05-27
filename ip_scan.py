@@ -67,17 +67,79 @@ class Term:
         code = f"1;{base}" if bold else base
         return self.style(text, code)
 
+    def rgb(self, text: str, r: int, g: int, b: int, *, bold: bool = False) -> str:
+        if not self.color:
+            return text
+        r = max(0, min(int(r), 255))
+        g = max(0, min(int(g), 255))
+        b = max(0, min(int(b), 255))
+        base = f"38;2;{r};{g};{b}"
+        code = f"1;{base}" if bold else base
+        return self.style(text, code)
+
+    def bg_rgb(self, text: str, r: int, g: int, b: int) -> str:
+        if not self.color:
+            return text
+        r = max(0, min(int(r), 255))
+        g = max(0, min(int(g), 255))
+        b = max(0, min(int(b), 255))
+        return self.style(text, f"48;2;{r};{g};{b}")
+
     def ok(self, text: str) -> str:
-        return self.fg(text, 82, bold=True)
+        return self.rgb(text, 82, 255, 168, bold=True)
 
     def warn(self, text: str) -> str:
-        return self.fg(text, 214, bold=True)
+        return self.rgb(text, 255, 184, 107, bold=True)
 
     def bad(self, text: str) -> str:
-        return self.fg(text, 196, bold=True)
+        return self.rgb(text, 255, 92, 122, bold=True)
 
     def info(self, text: str) -> str:
-        return self.fg(text, 81, bold=True)
+        return self.rgb(text, 69, 183, 255, bold=True)
+
+    def neon(self, text: str) -> str:
+        return self.rgb(text, 82, 255, 168, bold=True)
+
+    def violet(self, text: str, *, bold: bool = False) -> str:
+        return self.rgb(text, 183, 124, 255, bold=bold)
+
+    def cyan(self, text: str, *, bold: bool = False) -> str:
+        return self.rgb(text, 69, 183, 255, bold=bold)
+
+    def gray(self, text: str) -> str:
+        return self.fg(text, 246)
+
+    def rule(self, ch: str = "─") -> str:
+        width = _terminal_width()
+        sym = ch if self._supports_text(ch) else "-"
+        return self.gray(sym * min(150, width))
+
+    def bullet(self) -> str:
+        return self.gray("-")
+
+    def _supports_text(self, s: str) -> bool:
+        try:
+            enc = sys.stdout.encoding or "utf-8"
+        except Exception:
+            enc = "utf-8"
+        try:
+            s.encode(enc, errors="strict")
+            return True
+        except Exception:
+            return False
+
+    def tag(self, label: str, *, color: str = "cyan") -> str:
+        lab = label.strip().upper()
+        if not self.color:
+            return lab
+        inner = f" {lab} "
+        if color == "green":
+            return self.bg_rgb(self.rgb(inner, 5, 12, 9, bold=True), 10, 28, 20)
+        if color == "violet":
+            return self.bg_rgb(self.rgb(inner, 22, 12, 28, bold=True), 18, 10, 24)
+        if color == "red":
+            return self.bg_rgb(self.rgb(inner, 28, 10, 14, bold=True), 24, 8, 12)
+        return self.bg_rgb(self.rgb(inner, 10, 16, 30, bold=True), 8, 14, 28)
 
     def link(self, text: str, url: str) -> str:
         if not self.links:
@@ -586,10 +648,53 @@ def print_rdap_block(idx: int, ip: str, rdap_url: str, summary: Dict[str, Any], 
         src = urllib.parse.urlparse(rdap_url).hostname or ""
     except Exception:
         src = ""
-    head = term.fg("RDAP", 141, bold=True) + term.dim(" :: ") + term.link(ip, rdap_url)
+    head = term.tag("RDAP", color="violet") + term.dim("  ") + term.cyan(term.link(ip, rdap_url), bold=True)
     if src:
-        head += term.dim(" @ ") + term.dim(src)
+        head += term.gray("  @  ") + term.gray(src)
     print("  " + head)
+
+    def fmt_key(k: str) -> str:
+        return term.gray(f"{k}:").rjust(key_w)
+
+    def fmt_val(k: str, s: str) -> str:
+        v = str(s or "").strip()
+        if not v:
+            return v
+        lk = k.lower()
+        if lk in ("netrange", "cidr"):
+            return term.cyan(v, bold=True)
+        if lk in ("netname",):
+            return term.violet(v, bold=True)
+        if lk in ("nethandle", "parent"):
+            return term.gray(v)
+        if lk in ("nettype",):
+            return term.gray(v)
+        if lk in ("status",):
+            low = v.lower()
+            if "active" in low or "allocated" in low:
+                return term.ok(v)
+            if "reserved" in low or "inactive" in low:
+                return term.bad(v)
+            return term.warn(v)
+        if lk in ("country",):
+            return term.violet(v, bold=True)
+        if lk in ("orgname",):
+            return term.neon(v)
+        if lk in ("orgid",):
+            return term.cyan(v, bold=True)
+        if lk in ("regdate", "updated"):
+            return term.gray(v)
+        if lk in ("originas",):
+            tokens = [t.strip().upper() for t in re.split(r"[,\s]+", v) if t.strip()]
+            asns = [t if t.startswith("AS") else f"AS{t}" for t in tokens]
+            parts: List[str] = []
+            for a in asns[:12]:
+                parts.append(term.violet(term.link(a, url_bgp_asn(a)), bold=True))
+            return ", ".join(parts) if parts else term.gray(v)
+        if lk in ("ref",) and v.startswith("http"):
+            return term.cyan(term.link(v, v), bold=True)
+        return term.gray(v)
+
     fields = [
         ("NetRange", summary.get("NetRange")),
         ("CIDR", summary.get("CIDR")),
@@ -611,25 +716,28 @@ def print_rdap_block(idx: int, ip: str, rdap_url: str, summary: Dict[str, Any], 
         if not s:
             continue
         if k == "Ref" and s.startswith("http"):
-            left = term.dim(f"{k}:").rjust(key_w)
+            left = fmt_key(k)
             prefix = f"  {left} "
-            disp = term.link(s, s)
-            print(prefix + disp)
+            print(prefix + fmt_val(k, s))
             continue
-        left = term.dim(f"{k}:").rjust(key_w)
+        left = fmt_key(k)
         prefix = f"  {left} "
         indent = _visible_len(prefix)
-        wrapped = _wrap_text(s, max(20, width - indent))
+        wrapped = _wrap_text(_strip_ansi(str(fmt_val(k, s))), max(20, width - indent))
         if not wrapped:
             continue
-        print(prefix + wrapped[0])
-        for more in wrapped[1:3]:
-            print(" " * indent + more)
+        val = fmt_val(k, s)
+        if _visible_len(val) <= max(20, width - indent):
+            print(prefix + val)
+        else:
+            print(prefix + term.gray(wrapped[0]))
+            for more in wrapped[1:3]:
+                print(" " * indent + term.gray(more))
     remarks = summary.get("Remarks")
     if isinstance(remarks, list) and remarks:
         clean = [_sanitize_rdap_text(x, max_len=1400, hide_cert=True) for x in remarks if str(x or "").strip()]
         if clean:
-            left = term.dim("Comment:").rjust(key_w)
+            left = fmt_key("Comment")
             prefix = f"  {left} "
             indent = _visible_len(prefix)
             for i, item in enumerate(clean[:2]):
@@ -640,14 +748,14 @@ def print_rdap_block(idx: int, ip: str, rdap_url: str, summary: Dict[str, Any], 
                 wrapped = _wrap_text(item, max(20, width - indent))
                 if not wrapped:
                     continue
-                print(pfx + wrapped[0])
+                print(pfx + term.gray(wrapped[0]))
                 for more in wrapped[1:4]:
-                    print(" " * indent + more)
+                    print(" " * indent + term.gray(more))
     notices = summary.get("Notices")
     if isinstance(notices, list) and notices:
         clean = [_sanitize_rdap_text(x, max_len=800, hide_cert=True) for x in notices if str(x or "").strip()]
         if clean:
-            left = term.dim("Notices:").rjust(key_w)
+            left = fmt_key("Notices")
             prefix = f"  {left} "
             indent = _visible_len(prefix)
             for i, item in enumerate(clean[:2]):
@@ -658,12 +766,12 @@ def print_rdap_block(idx: int, ip: str, rdap_url: str, summary: Dict[str, Any], 
                 wrapped = _wrap_text(item, max(20, width - indent))
                 if not wrapped:
                     continue
-                print(pfx + wrapped[0])
+                print(pfx + term.gray(wrapped[0]))
                 for more in wrapped[1:4]:
-                    print(" " * indent + more)
+                    print(" " * indent + term.gray(more))
     contacts = summary.get("Contacts")
     if isinstance(contacts, list) and contacts:
-        left = term.dim("Contacts:").rjust(key_w)
+        left = term.gray("Contacts:").rjust(key_w)
         print(f"  {left}")
         seen_lines: Set[str] = set()
         for c in contacts[:12]:
@@ -675,17 +783,17 @@ def print_rdap_block(idx: int, ip: str, rdap_url: str, summary: Dict[str, Any], 
             tel = ", ".join(c.get("tel") or []) if isinstance(c, dict) else ""
             adr = ", ".join(c.get("adr") or []) if isinstance(c, dict) else ""
             handle = str(c.get("handle") or "") if isinstance(c, dict) else ""
-            line = f"    {term.dim('-')} {term.fg(role.upper(), 75, bold=True)}"
+            line = f"    {term.bullet()} {term.rgb(role.upper(), 120, 200, 255, bold=True)}"
             if handle:
-                line += term.dim(" :: ") + handle
+                line += term.gray(" :: ") + term.gray(handle)
             if name:
-                line += term.dim(" :: ") + name
+                line += term.gray(" :: ") + term.violet(name)
             if email:
-                line += term.dim(" :: ") + email
+                line += term.gray(" :: ") + term.cyan(email)
             if tel:
-                line += term.dim(" :: ") + tel
+                line += term.gray(" :: ") + term.neon(tel)
             if adr:
-                line += term.dim(" :: ") + adr
+                line += term.gray(" :: ") + term.gray(adr)
             if line in seen_lines:
                 continue
             seen_lines.add(line)
@@ -780,28 +888,28 @@ def tls_probe(host: str, timeout_s: float) -> Dict[str, Any]:
 def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Dict[str, Any]], term: Term) -> None:
     width = _terminal_width()
     print("")
-    print(term.info("HTTP") + term.dim(" :: ") + term.link(host, f"https://{host}/"))
+    print(term.tag("HTTP", color="cyan") + term.dim("  ") + term.cyan(term.link(host, f"https://{host}/"), bold=True))
     results = http_data.get("results") if isinstance(http_data, dict) else None
     if not isinstance(results, list):
-        print(term.dim("  (no data)"))
+        print(term.gray("  (no data)"))
         return
     for r in results:
         if not isinstance(r, dict):
             continue
         url = str(r.get("url") or "")
         if r.get("error"):
-            print(f"  {term.dim('-')} {term.link(url, url)} {term.dim('->')} {term.bad('ERR')} {r.get('error')}")
+            print(f"  {term.bullet()} {term.link(url, url)} {term.gray('->')} {term.bad('ERR')} {term.gray(str(r.get('error') or ''))}")
             continue
         status = int(r.get("status") or 0)
         final_url = str(r.get("final_url") or "")
         st = term.ok(str(status)) if 200 <= status < 400 else term.warn(str(status)) if status else term.bad("0")
-        line = f"  {term.dim('-')} {term.link(url, url)} {term.dim('->')} {st}"
+        line = f"  {term.bullet()} {term.link(url, url)} {term.gray('->')} {st}"
         if final_url and final_url != url:
-            line += term.dim(" :: ") + term.link(_truncate_middle(final_url, 80), final_url)
+            line += term.gray(" :: ") + term.link(_truncate_middle(final_url, 80), final_url)
         print(line)
         title = str(r.get("title") or "").strip()
         if title:
-            print(f"    {term.dim('title:')} {_truncate_middle(title, max(40, width - 16))}")
+            print(f"    {term.gray('title:')} {term.violet(_truncate_middle(title, max(40, width - 16)))}")
         server = str(r.get("server") or "").strip()
         powered = str(r.get("powered_by") or "").strip()
         ctype = str(r.get("content_type") or "").strip()
@@ -813,32 +921,32 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
                 bits.append(f"x-powered-by={powered}")
             if ctype:
                 bits.append(f"type={ctype}")
-            print(f"    {term.dim('info:')} {_truncate_middle(' | '.join(bits), max(50, width - 16))}")
+            print(f"    {term.gray('info:')} {term.gray(_truncate_middle(' | '.join(bits), max(50, width - 16)))}")
         sec = []
         for k in ["hsts", "csp", "xfo", "xcto", "refpol", "permissions"]:
             v = str(r.get(k) or "").strip()
             if v:
                 sec.append(k.upper())
         if sec:
-            print(f"    {term.dim('sec:')} {', '.join(sec)}")
+            print(f"    {term.gray('sec:')} {term.neon(', '.join(sec))}")
     if tls_data:
-        print(term.info("TLS") + term.dim(" :: ") + host)
+        print(term.tag("TLS", color="violet") + term.dim("  ") + term.violet(host, bold=True))
         if not tls_data.get("ok"):
-            print(f"  {term.dim('-')} {term.bad('ERR')} {tls_data.get('error')}")
+            print(f"  {term.bullet()} {term.bad('ERR')} {term.gray(str(tls_data.get('error') or ''))}")
             return
         proto = str(tls_data.get("protocol") or "")
         cipher = str(tls_data.get("cipher") or "")
         nb = str(tls_data.get("notBefore") or "")
         na = str(tls_data.get("notAfter") or "")
         if proto or cipher:
-            print(f"  {term.dim('-')} {proto} {term.dim('|')} {cipher}")
+            print(f"  {term.bullet()} {term.cyan(proto, bold=True)} {term.gray('|')} {term.gray(cipher)}")
         if nb or na:
-            print(f"  {term.dim('-')} valid: {nb} {term.dim('->')} {na}")
+            print(f"  {term.bullet()} {term.gray('valid:')} {term.gray(nb)} {term.gray('->')} {term.gray(na)}")
         san = tls_data.get("subjectAltName")
         if isinstance(san, list) and san:
             names = [str(v) for (t, v) in san if str(t) == "DNS" and str(v)]
             if names:
-                print(f"  {term.dim('-')} san: " + _truncate_middle(", ".join(names[:20]), max(50, width - 10)))
+                print(f"  {term.bullet()} {term.gray('san:')} " + term.gray(_truncate_middle(", ".join(names[:20]), max(50, width - 10))))
 
 
 def geo_ip_api_com(ip: str, timeout_s: float) -> Optional[GeoResult]:
@@ -1269,25 +1377,26 @@ def is_domain_like(s: str) -> bool:
 
 def print_domain_info(domain: str, info: Dict[str, List[str]], *, dns_servers: List[str], timeout_s: float, term: Term) -> None:
     print("")
-    dom = term.link(domain, url_dns_google(domain)) if looks_like_domain(domain) else domain
-    print(term.info("DOMAIN") + term.dim(" :: ") + dom)
+    dom_raw = domain
+    dom = term.link(dom_raw, url_dns_google(dom_raw)) if looks_like_domain(dom_raw) else dom_raw
+    print(term.tag("DOMAIN", color="cyan") + term.dim("  ") + term.cyan(dom, bold=True))
     if not info:
-        print(term.dim("DNS: tidak ada data atau gagal query."))
+        print(term.gray("DNS: tidak ada data atau gagal query."))
         return
     order = ["CNAME", "A", "AAAA", "NS", "MX", "TXT", "SOA"]
     for k in order:
         vals = info.get(k)
         if not vals:
             continue
-        print(term.fg(k, 207, bold=True) + term.dim(":"))
+        print(term.violet(k, bold=True) + term.gray(":"))
         for v in vals:
             vv = v
             if looks_like_ip(v):
-                vv = term.link(v, url_ipinfo(v))
+                vv = term.cyan(term.link(v, url_ipinfo(v)))
             elif looks_like_domain(v.split()[-1]):
                 d = v.split()[-1]
-                vv = v.replace(d, term.link(d, url_whois_domain(d)))
-            print(f"  {term.dim('-')} {vv}")
+                vv = v.replace(d, term.violet(term.link(d, url_whois_domain(d))))
+            print(f"  {term.bullet()} {vv}")
     ips = (info.get("A") or []) + (info.get("AAAA") or [])
     if ips:
         ptr_map: List[Tuple[str, List[str]]] = []
@@ -1296,12 +1405,12 @@ def print_domain_info(domain: str, info: Dict[str, List[str]], *, dns_servers: L
             if ptrs:
                 ptr_map.append((ip, ptrs))
         if ptr_map:
-            print(term.fg("PTR", 207, bold=True) + term.dim(":"))
+            print(term.violet("PTR", bold=True) + term.gray(":"))
             for ip, ptrs in ptr_map:
                 for p in ptrs:
-                    left = term.link(ip, url_ipinfo(ip))
-                    right = term.link(p, url_whois_domain(p)) if looks_like_domain(p) else p
-                    print(f"  {term.dim('-')} {left} {term.dim('->')} {right}")
+                    left = term.cyan(term.link(ip, url_ipinfo(ip)))
+                    right = term.violet(term.link(p, url_whois_domain(p))) if looks_like_domain(p) else p
+                    print(f"  {term.bullet()} {left} {term.gray('->')} {right}")
 
 
 def expand_targets(items: Iterable[str]) -> List[str]:
@@ -1335,21 +1444,21 @@ def is_public_ip(ip: str) -> bool:
 def format_row(idx: int, res: GeoResult, term: Term) -> str:
     place = ", ".join([p for p in [res.city, res.region, res.country] if p])
     org = res.org or res.isp
-    ip_disp = term.link(res.ip, url_ipinfo(res.ip))
+    ip_disp = term.cyan(term.link(res.ip, url_ipinfo(res.ip)), bold=True)
     coords_txt = f"{res.lat:>9.5f},{res.lon:>10.5f}"
-    coords = term.link(coords_txt, url_google_maps(res.lat, res.lon))
+    coords = term.rgb(term.link(coords_txt, url_google_maps(res.lat, res.lon)), 120, 200, 255, bold=True)
     asn = ""
     if res.asn:
         token = res.asn.strip().split()[0]
         if token.upper().startswith("AS"):
             asn = token.upper()
-    asn_disp = term.link(asn, url_bgp_asn(asn)) if asn else ""
-    src = term.dim(res.source)
+    asn_disp = term.violet(term.link(asn, url_bgp_asn(asn)), bold=True) if asn else ""
+    src = term.gray(res.source)
     parts = [
-        f"{term.dim(str(idx).rjust(3))}",
+        f"{term.gray(str(idx).rjust(3))}",
         f"{ip_disp:>39}",
-        f"{place:<32.32}",
-        f"{(org or ''):<28.28}",
+        f"{term.violet(place):<32.32}",
+        f"{term.neon((org or '')[:28]):<28.28}",
         f"{coords:>21}",
         f"{src}",
         f"{asn_disp}",
@@ -1611,37 +1720,40 @@ def run_scan(
             print_domain_info(host, info, dns_servers=dns_servers, timeout_s=timeout_s, term=term)
             related = _extract_hosts_from_dns_info(host, info)
             if related:
-                print(term.info("RELATED") + term.dim(" :: ") + "NS/MX/CNAME/WWW")
+                print(term.tag("RELATED", color="cyan") + term.dim("  ") + term.gray("NS/MX/CNAME/WWW"))
                 for rh in related[: max(0, int(max_related))]:
                     ips_rh = dns_lookup_ips(rh, dns_servers=dns_servers, timeout_s=timeout_s)
                     if ips_rh:
-                        ip_join = ", ".join([term.link(ip, url_ipinfo(ip)) for ip in ips_rh])
-                        print(f"  {term.dim('-')} {term.link(rh, url_whois_domain(rh)) if looks_like_domain(rh) else rh} {term.dim('->')} {ip_join}")
+                        ip_join = ", ".join([term.cyan(term.link(ip, url_ipinfo(ip))) for ip in ips_rh])
+                        rh_disp = term.violet(term.link(rh, url_whois_domain(rh)), bold=True) if looks_like_domain(rh) else term.violet(rh, bold=True)
+                        print(f"  {term.bullet()} {rh_disp} {term.gray('->')} {ip_join}")
                         for ip in ips_rh:
                             resolved.append((rh, ip))
                     else:
-                        print(f"  {term.dim('-')} {term.link(rh, url_whois_domain(rh)) if looks_like_domain(rh) else rh} {term.dim('->')} {term.dim('no A/AAAA')}")
+                        rh_disp = term.violet(term.link(rh, url_whois_domain(rh)), bold=True) if looks_like_domain(rh) else term.violet(rh, bold=True)
+                        print(f"  {term.bullet()} {rh_disp} {term.gray('->')} {term.gray('no A/AAAA')}")
             if dns_extra:
                 sec = dns_security_profile(host, dns_servers=dns_servers, timeout_s=timeout_s)
                 if sec:
-                    print(term.info("DNS-EXTRA") + term.dim(" :: ") + "email/security")
+                    print(term.tag("DNS-EXTRA", color="violet") + term.dim("  ") + term.gray("email/security"))
                     for k in ["DMARC", "MTA-STS", "TLS-RPT"]:
                         vals = sec.get(k)
                         if not vals:
                             continue
-                        print(term.fg(k, 207, bold=True) + term.dim(":"))
+                        print(term.violet(k, bold=True) + term.gray(":"))
                         for v in vals[:6]:
-                            print(f"  {term.dim('-')} {v}")
+                            print(f"  {term.bullet()} {term.gray(v)}")
                 extras = []
                 for hn in [f"autodiscover.{host}", f"mail.{host}"]:
                     ips_e = dns_lookup_ips(hn, dns_servers=dns_servers, timeout_s=timeout_s)
                     if ips_e:
                         extras.append((hn, ips_e))
                 if extras:
-                    print(term.info("HOSTS") + term.dim(" :: ") + "autodiscover/mail")
+                    print(term.tag("HOSTS", color="cyan") + term.dim("  ") + term.gray("autodiscover/mail"))
                     for hn, ips_e in extras:
-                        ip_join = ", ".join([term.link(ip, url_ipinfo(ip)) for ip in ips_e])
-                        print(f"  {term.dim('-')} {term.link(hn, url_whois_domain(hn)) if looks_like_domain(hn) else hn} {term.dim('->')} {ip_join}")
+                        ip_join = ", ".join([term.cyan(term.link(ip, url_ipinfo(ip))) for ip in ips_e])
+                        hn_disp = term.violet(term.link(hn, url_whois_domain(hn)), bold=True) if looks_like_domain(hn) else term.violet(hn, bold=True)
+                        print(f"  {term.bullet()} {hn_disp} {term.gray('->')} {ip_join}")
                         for ip in ips_e:
                             resolved.append((hn, ip))
             if http_recon:
@@ -1676,17 +1788,17 @@ def run_scan(
     failed = 0
 
     print("")
-    print(term.info("SCAN") + term.dim(" :: ") + f"target IP unik = {term.bold(str(total))}")
+    print(term.tag("SCAN", color="green") + term.dim("  ") + term.gray("target IP unik = ") + term.neon(str(total)))
     width = _terminal_width()
-    rule = term.dim("-" * min(150, width))
+    rule = term.rule()
     header = [
-        term.dim("IDX"),
-        term.dim("IP"),
-        term.dim("LOKASI"),
-        term.dim("ORG/ISP"),
-        term.dim("KOORDINAT (klik)"),
-        term.dim("PROVIDER"),
-        term.dim("ASN"),
+        term.gray("IDX"),
+        term.cyan("IP", bold=True),
+        term.violet("LOKASI", bold=True),
+        term.neon("ORG/ISP"),
+        term.rgb("KOORDINAT (klik)", 120, 200, 255, bold=True),
+        term.gray("PROVIDER"),
+        term.violet("ASN", bold=True),
     ]
     print(" | ".join(header))
     print(rule)
@@ -1739,10 +1851,10 @@ def run_scan(
                         netname = str(summary.get("NetName") or "").strip()
                         cidr = str(summary.get("CIDR") or "").strip()
                         hint = " ".join([p for p in [netname, cidr] if p]).strip()
-                        line = term.dim("  ") + term.fg("RDAP", 141, bold=True) + term.dim(" :: ") + term.link(ip, rdap_url)
-                        line += term.dim(" = same-net #") + term.bold(str(first_idx))
+                        line = term.dim("  ") + term.tag("RDAP", color="violet") + term.dim("  ") + term.cyan(term.link(ip, rdap_url), bold=True)
+                        line += term.gray("  = same-net #") + term.neon(str(first_idx))
                         if hint:
-                            line += term.dim(" :: ") + _truncate_middle(hint, 80)
+                            line += term.gray(" :: ") + term.gray(_truncate_middle(hint, 80))
                         print(line)
                 except Exception:
                     pass
@@ -1764,19 +1876,19 @@ def run_scan(
 
     if results:
         print("")
-        print(term.info("SUMMARY") + term.dim(" :: ") + "ringkas")
+        print(term.tag("SUMMARY", color="cyan") + term.dim("  ") + term.gray("ringkas"))
         top_org = _top_counts(orgs, 4)
         top_cc = _top_counts(countries, 4)
         top_asn = _top_counts(asns, 6)
         if top_org:
             s = ", ".join([f"{name}({cnt})" for name, cnt in top_org])
-            print(f"  {term.dim('-')} org: {s}")
+            print(f"  {term.bullet()} {term.gray('org:')} {term.neon(s)}")
         if top_cc:
             s = ", ".join([f"{name}({cnt})" for name, cnt in top_cc])
-            print(f"  {term.dim('-')} country: {s}")
+            print(f"  {term.bullet()} {term.gray('country:')} {term.violet(s)}")
         if top_asn:
             s = ", ".join([f"{name}({cnt})" for name, cnt in top_asn])
-            print(f"  {term.dim('-')} asn: {s}")
+            print(f"  {term.bullet()} {term.gray('asn:')} {term.cyan(s)}")
 
     if interactive and results and sys.stdin is not None and sys.stdin.isatty():
         print("")
@@ -1864,6 +1976,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--full", action="store_true", help="Mode lengkap (setara: --rdap --menu)")
     p.add_argument("--no-color", action="store_true", help="Matikan warna output")
     p.add_argument("--no-links", action="store_true", help="Matikan link klik (OSC 8)")
+    p.add_argument("--force-color", action="store_true", help="Paksa warna output meski bukan TTY")
+    p.add_argument("--force-links", action="store_true", help="Paksa link klik (OSC 8) meski bukan TTY")
     p.add_argument("--menu", action="store_true", help="Aktifkan mode interaktif setelah scan")
     p.add_argument("--map", action="store_true", help="Aktifkan live map (server lokal + browser)")
     p.add_argument("--host", default="127.0.0.1", help="Host server map (default: 127.0.0.1)")
@@ -1875,9 +1989,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    color_on = (not bool(args.no_color)) and sys.stdout.isatty()
-    links_on = (not bool(args.no_links)) and sys.stdout.isatty()
+    force_color = bool(args.force_color) or bool(os.environ.get("FORCE_COLOR"))
+    force_links = bool(args.force_links) or bool(os.environ.get("FORCE_LINKS"))
+    is_tty = bool(sys.stdout.isatty())
+    color_on = (not bool(args.no_color)) and (is_tty or force_color)
+    links_on = (not bool(args.no_links)) and (is_tty or force_links)
     term = Term(color=color_on, links=links_on)
+    print(term.gray("By Nofri.Flory"))
     targets = list(args.targets)
     if args.file:
         try:
