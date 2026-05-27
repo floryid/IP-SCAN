@@ -236,7 +236,7 @@
         <div class="logo" aria-hidden="true"></div>
         <div>
           <h1>IP-SCAN</h1>
-          <p class="sub">Terminal recon toolkit — DNS • GeoIP • RDAP • HTTP/TLS</p>
+          <p class="sub">Terminal recon toolkit — DNS • GeoIP • RDAP • HTTP/TLS • Subdomain CT • Params</p>
         </div>
       </a>
       <div class="actions">
@@ -260,50 +260,72 @@
           <span class="pill">GitHub Pages</span>
           Landing page untuk project Python berbasis terminal
         </div>
-        <h2 class="title">Recon cepat, output rapi, klik-to-open, siap dipakai bug hunter.</h2>
+        <h2 class="title">Recon cepat, output neon, klik-to-open, siap dipakai bug hunter.</h2>
         <p class="lead">
-          IP-SCAN adalah aplikasi terminal berbasis Python untuk scan domain/IP: DNS lookup (termasuk record terkait),
-          GeoIP ke peta, RDAP (IP WHOIS), serta recon HTTP/TLS opsional.
+          IP-SCAN adalah aplikasi terminal berbasis Python untuk scan domain/IP: DNS lookup (termasuk host terkait),
+          GeoIP ke peta, RDAP (IP WHOIS), recon HTTP/TLS, pencarian subdomain pasif via CT (crt.sh),
+          dan enumerasi parameter pasif (termasuk hidden fields) + crawl ringan.
           Halaman ini hanya untuk informasi & cara pakai (aplikasinya dijalankan di terminal).
         </p>
       </div>
 
       <div class="grid">
         <div class="card">
-          <h2>Fitur</h2>
+          <h2>Fitur Lengkap</h2>
           <div class="body">
             <ul class="list">
               <li>
                 <span class="badge">01</span>
                 <div>
                   <b>DNS Recon</b>
-                  <span>Resolve domain, A/AAAA, NS/MX/TXT/SOA/CAA, PTR, host terkait (NS/MX/CNAME/WWW).</span>
+                  <span>Resolve domain: A/AAAA, NS/MX/TXT/SOA/CAA, PTR, host terkait (NS/MX/CNAME/WWW), autodiscover/mail, DMARC/MTA-STS/TLS-RPT.</span>
                 </div>
               </li>
               <li>
                 <span class="badge">02</span>
                 <div>
                   <b>GeoIP + Map</b>
-                  <span>Lookup lokasi IP (fallback provider) dan tampilkan marker real-time di peta.</span>
+                  <span>Ambil subdomain secara pasif dari Certificate Transparency (crt.sh), resolve A/AAAA, lalu ikut masuk ke SCAN.</span>
                 </div>
               </li>
               <li>
                 <span class="badge">03</span>
                 <div>
-                  <b>RDAP / IP WHOIS</b>
-                  <span>NetRange, CIDR, Org, status, kontak, referensi registry. Output dibersihkan dari spam.</span>
+                  <b>GeoIP + Map</b>
+                  <span>Lookup lokasi IP (fallback provider) dan tampilkan marker real-time di peta (Leaflet) saat scan berjalan.</span>
                 </div>
               </li>
               <li>
                 <span class="badge">04</span>
                 <div>
+                  <b>RDAP / IP WHOIS</b>
+                  <span>NetRange, CIDR, Org, status, kontak, referensi registry. Dedup netblock + hilangkan spam (contoh sertifikat panjang).</span>
+                </div>
+              </li>
+              <li>
+                <span class="badge">05</span>
+                <div>
                   <b>HTTP/TLS Recon</b>
-                  <span>Status/redirect, header security, title, info sertifikat TLS (opsional).</span>
+                  <span>Status/redirect, headers, title, security headers, info sertifikat TLS (SAN/validity/cipher).</span>
+                </div>
+              </li>
+              <li>
+                <span class="badge">06</span>
+                <div>
+                  <b>Params Discovery (Pasif)</b>
+                  <span>Ambil parameter dari query string, URL di HTML/JS, form fields, dan hidden inputs. Tampilkan contoh URL ber-parameter.</span>
+                </div>
+              </li>
+              <li>
+                <span class="badge">07</span>
+                <div>
+                  <b>Crawl Ringan (GET only)</b>
+                  <span>Crawl same-host untuk kumpulkan lebih banyak endpoint & parameter (tanpa fuzzing, tanpa brute force, tanpa POST).</span>
                 </div>
               </li>
             </ul>
             <p class="note">
-              Tips: untuk mode komplit, pakai <span class="kbd">--full</span>. Untuk disable warna/link: <span class="kbd">--no-color</span> / <span class="kbd">--no-links</span>.
+              Tips: mode komplit pakai <span class="kbd">--full</span>. Parameter & crawl pakai <span class="kbd">--params</span> + <span class="kbd">--crawl</span>. Subdomain CT pakai <span class="kbd">--ct</span>.
             </p>
           </div>
         </div>
@@ -330,18 +352,20 @@ python ip_scan.py --help</pre>
               <div class="bar">
                 <div class="left">
                   <span class="lights" aria-hidden="true"><i></i><i></i><i></i></span>
-                  <span>Contoh (Full)</span>
+                  <span>Contoh (Power Mode)</span>
                 </div>
                 <button class="copy" type="button" data-copy-btn="example">Copy</button>
               </div>
-              <pre id="example">python ip_scan.py idf.il --full
-python ip_scan.py 8.8.8.8 --rdap
-python ip_scan.py example.com --map</pre>
+              <pre id="example">python ip_scan.py test.com --full --crawl --crawl-pages 30 --crawl-depth 2 --params-limit 300 --params-urls 60
+python ip_scan.py test.com --ct --ct-limit 600 --ct-resolve 250
+python ip_scan.py test.com --map
+python ip_scan.py 8.8.8.8 --rdap</pre>
             </div>
 
             <p class="note">
               GitHub Pages tidak bisa menjalankan Python terminal app di browser.
               Jalankan dari terminal (Windows/Linux/macOS). Map mode akan membuka URL lokal seperti <span class="kbd">http://127.0.0.1:8000</span>.
+              Kalau warna/link tidak muncul di terminal tertentu, pakai <span class="kbd">--force-color</span> / <span class="kbd">--force-links</span>.
             </p>
           </div>
         </div>

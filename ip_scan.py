@@ -18,6 +18,7 @@ import urllib.request
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
+from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -827,9 +828,377 @@ def _try_http_request(url: str, timeout_s: float) -> Tuple[int, str, Dict[str, s
     return status, final_url, headers, body
 
 
-def http_probe(host: str, timeout_s: float) -> Dict[str, Any]:
+class _HTMLParamExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.urls: List[str] = []
+        self.param_names: Set[str] = set()
+        self.form_fields: Set[str] = set()
+        self.hidden_fields: Dict[str, str] = {}
+        self._in_script = False
+        self._script_chunks: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attr = {k.lower(): (v or "") for k, v in attrs}
+        if tag.lower() in ("a", "link"):
+            href = attr.get("href", "").strip()
+            if href:
+                self.urls.append(href)
+        if tag.lower() in ("script", "img", "iframe"):
+            src = attr.get("src", "").strip()
+            if src:
+                self.urls.append(src)
+            if tag.lower() == "script" and not src:
+                self._in_script = True
+        if tag.lower() in ("form",):
+            action = attr.get("action", "").strip()
+            if action:
+                self.urls.append(action)
+        if tag.lower() in ("input", "select", "textarea", "button"):
+            name = attr.get("name", "").strip()
+            if name:
+                self.form_fields.add(name)
+            if tag.lower() == "input":
+                t = attr.get("type", "").strip().lower()
+                if t == "hidden" and name:
+                    v = attr.get("value", "")
+                    v = re.sub(r"\s+", " ", str(v or "")).strip()
+                    if v:
+                        self.hidden_fields[name] = v
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script":
+            self._in_script = False
+
+    def handle_data(self, data: str) -> None:
+        if not self._in_script:
+            return
+        s = str(data or "")
+        if not s.strip():
+            return
+        if sum(len(x) for x in self._script_chunks) > 200_000:
+            return
+        self._script_chunks.append(s)
+
+    def script_text(self) -> str:
+        return "\n".join(self._script_chunks)
+
+
+def _extract_param_names_from_url(url: str) -> Set[str]:
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return set()
+    out: Set[str] = set()
+    for k, _ in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        kk = str(k or "").strip()
+        if kk:
+            out.add(kk)
+    return out
+
+
+def _normalize_candidate_url(candidate: str, base: str) -> str:
+    c = (candidate or "").strip()
+    if not c:
+        return ""
+    if c.startswith("javascript:") or c.startswith("mailto:") or c.startswith("tel:"):
+        return ""
+    if c.startswith("#"):
+        return ""
+    try:
+        return urllib.parse.urljoin(base, c)
+    except Exception:
+        return ""
+
+
+def _should_enqueue_crawl(url: str, *, same_host: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except Exception:
+        return False
+    if parts.scheme not in ("http", "https"):
+        return False
+    if not parts.hostname or parts.hostname.lower() != same_host.lower():
+        return False
+    if parts.query:
+        return False
+    return True
+
+
+def _crawl_normalize(url: str) -> str:
+    try:
+        p = urllib.parse.urlsplit(url)
+    except Exception:
+        return url
+    return urllib.parse.urlunsplit((p.scheme, p.netloc, p.path or "/", "", ""))
+
+
+def _try_http_request_limited(url: str, timeout_s: float, max_bytes: int) -> Tuple[int, str, Dict[str, str], bytes]:
+    max_bytes = max(10_000, min(int(max_bytes), 1_500_000))
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "IP-SCAN/1.0 (+terminal)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        status = int(getattr(resp, "status", 0) or 0)
+        final_url = str(getattr(resp, "geturl", lambda: url)())
+        headers = {str(k): str(v) for k, v in resp.headers.items()}
+        body = resp.read(max_bytes)
+    return status, final_url, headers, body
+
+
+def http_crawl_params(
+    host: str,
+    *,
+    seed_urls: List[str],
+    timeout_s: float,
+    max_pages: int,
+    max_depth: int,
+    max_bytes: int,
+    params_url_limit: int,
+    params_limit: int,
+) -> Dict[str, Any]:
+    max_pages = max(1, min(int(max_pages), 200))
+    max_depth = max(0, min(int(max_depth), 3))
+
+    q: List[Tuple[str, int]] = []
+    seen: Set[str] = set()
+    for u in seed_urls:
+        nu = _crawl_normalize(u)
+        if nu in seen:
+            continue
+        seen.add(nu)
+        q.append((nu, 0))
+
+    all_params: Set[str] = set()
+    urls_with_params: List[str] = []
+    hidden_fields: List[Tuple[str, str]] = []
+    pages_ok = 0
+    pages_err = 0
+
+    while q and (pages_ok + pages_err) < max_pages:
+        cur, depth = q.pop(0)
+        try:
+            status, final_url, headers, body = _try_http_request_limited(cur, timeout_s, max_bytes=max_bytes)
+        except Exception:
+            pages_err += 1
+            continue
+        if status and status >= 400:
+            pages_err += 1
+            continue
+        ctype = str(headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "xhtml" not in ctype and "xml" not in ctype:
+            pages_ok += 1
+            continue
+        text = body.decode("utf-8", errors="replace")
+        base = final_url or cur
+        params = _extract_params_passive(text, base_url=base, same_host=host, url_limit=max(10, int(params_url_limit)), param_limit=max(50, int(params_limit)))
+
+        names = params.get("param_names")
+        if isinstance(names, list):
+            for n in names:
+                nn = str(n or "").strip()
+                if nn:
+                    all_params.add(nn)
+                    if len(all_params) >= int(params_limit):
+                        break
+
+        h = params.get("hidden_fields")
+        if isinstance(h, list):
+            for pair in h[:40]:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                k = str(pair[0] or "").strip()
+                v = str(pair[1] or "").strip()
+                if not k or not v:
+                    continue
+                hidden_fields.append((k, v))
+                if len(hidden_fields) >= 80:
+                    break
+
+        ups = params.get("urls_with_params")
+        if isinstance(ups, list):
+            for u in ups:
+                su = str(u or "").strip()
+                if not su:
+                    continue
+                if len(urls_with_params) < int(params_url_limit):
+                    urls_with_params.append(su)
+
+        pages_ok += 1
+        if depth >= max_depth:
+            continue
+
+        parser = _HTMLParamExtractor()
+        try:
+            parser.feed(text)
+        except Exception:
+            continue
+        for u in parser.urls[:500]:
+            full = _normalize_candidate_url(u, base)
+            if not full:
+                continue
+            if not _should_enqueue_crawl(full, same_host=host):
+                continue
+            nu = _crawl_normalize(full)
+            if nu in seen:
+                continue
+            seen.add(nu)
+            q.append((nu, depth + 1))
+            if len(q) > 2000:
+                break
+
+    uniq_hidden: List[Tuple[str, str]] = []
+    seen_h: Set[str] = set()
+    for k, v in hidden_fields:
+        key = f"{k}={v}"
+        if key in seen_h:
+            continue
+        seen_h.add(key)
+        uniq_hidden.append((k, v))
+        if len(uniq_hidden) >= 60:
+            break
+
+    uniq_urls: List[str] = []
+    seen_u: Set[str] = set()
+    for u in urls_with_params:
+        if u in seen_u:
+            continue
+        seen_u.add(u)
+        uniq_urls.append(u)
+        if len(uniq_urls) >= int(params_url_limit):
+            break
+
+    return {
+        "pages_ok": pages_ok,
+        "pages_err": pages_err,
+        "param_names": sorted(all_params)[: int(params_limit)],
+        "count_params": len(all_params),
+        "urls_with_params": uniq_urls,
+        "hidden_fields": uniq_hidden,
+    }
+
+
+def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, url_limit: int, param_limit: int) -> Dict[str, Any]:
+    url_limit = max(1, min(int(url_limit), 200))
+    param_limit = max(1, min(int(param_limit), 500))
+    parser = _HTMLParamExtractor()
+    try:
+        parser.feed(html_text)
+    except Exception:
+        pass
+
+    urls_with_params: List[str] = []
+    params: Set[str] = set()
+
+    for u in parser.urls:
+        full = _normalize_candidate_url(u, base_url)
+        if not full:
+            continue
+        try:
+            parts = urllib.parse.urlsplit(full)
+        except Exception:
+            continue
+        if parts.scheme not in ("http", "https"):
+            continue
+        if parts.hostname and parts.hostname.lower() != same_host.lower():
+            continue
+        pnames = _extract_param_names_from_url(full)
+        if pnames:
+            params |= pnames
+            if len(urls_with_params) < url_limit:
+                urls_with_params.append(full)
+        if len(params) >= param_limit and len(urls_with_params) >= url_limit:
+            break
+
+    for name in list(parser.form_fields):
+        nn = str(name or "").strip()
+        if nn:
+            params.add(nn)
+        if len(params) >= param_limit:
+            break
+
+    rx = re.findall(r"[?&]([A-Za-z0-9_\\-]{1,60})=", html_text)
+    for k in rx[: max(0, param_limit * 2)]:
+        if len(params) >= param_limit:
+            break
+        kk = str(k or "").strip()
+        if kk:
+            params.add(kk)
+
+    hidden_pairs: List[Tuple[str, str]] = []
+    for k, v in (parser.hidden_fields or {}).items():
+        kk = str(k or "").strip()
+        vv = str(v or "").strip()
+        if not kk or not vv:
+            continue
+        params.add(kk)
+        hidden_pairs.append((kk, _truncate_middle(vv, 120)))
+        if len(hidden_pairs) >= 60:
+            break
+
+    js = parser.script_text()
+    if js:
+        for u in re.findall(r"""(?:(?:https?://)[^"'\\s<>]{1,240}|(?:/)[^"'\\s<>]{1,240})""", js):
+            full = _normalize_candidate_url(u, base_url)
+            if not full:
+                continue
+            try:
+                parts = urllib.parse.urlsplit(full)
+            except Exception:
+                continue
+            if parts.scheme not in ("http", "https"):
+                continue
+            if parts.hostname and parts.hostname.lower() != same_host.lower():
+                continue
+            pnames = _extract_param_names_from_url(full)
+            if pnames:
+                params |= pnames
+                if len(urls_with_params) < url_limit:
+                    urls_with_params.append(full)
+            if len(params) >= param_limit and len(urls_with_params) >= url_limit:
+                break
+
+        for pat in [
+            r"""\b(?:append|set|get)\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*,""",
+            r"""\bgetParameter\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*\)""",
+            r"""\bURLSearchParams\([^)]*\)\.get\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*\)""",
+        ]:
+            for m in re.finditer(pat, js):
+                if len(params) >= param_limit:
+                    break
+                kk = str(m.group(1) or "").strip()
+                if kk:
+                    params.add(kk)
+
+    return {
+        "param_names": sorted(params)[:param_limit],
+        "urls_with_params": urls_with_params[:url_limit],
+        "form_fields": sorted(parser.form_fields)[: min(200, len(parser.form_fields))],
+        "hidden_fields": hidden_pairs,
+        "count_params": len(params),
+    }
+
+
+def http_probe(
+    host: str,
+    timeout_s: float,
+    *,
+    params: bool,
+    params_url_limit: int,
+    params_limit: int,
+    crawl: bool,
+    crawl_pages: int,
+    crawl_depth: int,
+    crawl_bytes: int,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {"host": host, "results": []}
     schemes = ["https", "http"]
+    seed_urls: List[str] = []
     for sch in schemes:
         url = f"{sch}://{host}/"
         try:
@@ -839,27 +1208,102 @@ def http_probe(host: str, timeout_s: float) -> Dict[str, Any]:
             m = re.search(r"<title[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
             if m:
                 title = re.sub(r"\s+", " ", m.group(1)).strip()
-            out["results"].append(
-                {
-                    "url": url,
-                    "status": status,
-                    "final_url": final_url,
-                    "server": headers.get("Server", ""),
-                    "powered_by": headers.get("X-Powered-By", ""),
-                    "content_type": headers.get("Content-Type", ""),
-                    "content_length": headers.get("Content-Length", ""),
-                    "hsts": headers.get("Strict-Transport-Security", ""),
-                    "csp": headers.get("Content-Security-Policy", ""),
-                    "xfo": headers.get("X-Frame-Options", ""),
-                    "xxp": headers.get("X-XSS-Protection", ""),
-                    "xcto": headers.get("X-Content-Type-Options", ""),
-                    "refpol": headers.get("Referrer-Policy", ""),
-                    "permissions": headers.get("Permissions-Policy", ""),
-                    "title": title,
-                }
-            )
+            row: Dict[str, Any] = {
+                "url": url,
+                "status": status,
+                "final_url": final_url,
+                "server": headers.get("Server", ""),
+                "powered_by": headers.get("X-Powered-By", ""),
+                "content_type": headers.get("Content-Type", ""),
+                "content_length": headers.get("Content-Length", ""),
+                "hsts": headers.get("Strict-Transport-Security", ""),
+                "csp": headers.get("Content-Security-Policy", ""),
+                "xfo": headers.get("X-Frame-Options", ""),
+                "xxp": headers.get("X-XSS-Protection", ""),
+                "xcto": headers.get("X-Content-Type-Options", ""),
+                "refpol": headers.get("Referrer-Policy", ""),
+                "permissions": headers.get("Permissions-Policy", ""),
+                "title": title,
+            }
+            if params:
+                base = final_url or url
+                row["params"] = _extract_params_passive(
+                    text,
+                    base_url=base,
+                    same_host=host,
+                    url_limit=int(params_url_limit),
+                    param_limit=int(params_limit),
+                )
+            out["results"].append(row)
+            if status and 200 <= status < 400:
+                seed_urls.append(final_url or url)
         except Exception as e:
             out["results"].append({"url": url, "error": str(e)})
+    if crawl and params:
+        if not seed_urls:
+            seed_urls = [f"https://{host}/", f"http://{host}/"]
+        out["crawl"] = http_crawl_params(
+            host,
+            seed_urls=seed_urls[:2],
+            timeout_s=timeout_s,
+            max_pages=int(crawl_pages),
+            max_depth=int(crawl_depth),
+            max_bytes=int(crawl_bytes),
+            params_url_limit=int(params_url_limit),
+            params_limit=int(params_limit),
+        )
+    return out
+
+
+def ct_fetch_subdomains(domain: str, *, timeout_s: float, limit: int) -> List[str]:
+    d = domain.strip().strip(".").lower()
+    if not d or "." not in d:
+        return []
+    limit = max(1, min(int(limit), 2000))
+    url = f"https://crt.sh/?q={urllib.parse.quote('%25.' + d)}&output=json"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "IP-SCAN/1.0 (+terminal)",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read(6_000_000)
+    except Exception:
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        nv = row.get("name_value")
+        if not isinstance(nv, str):
+            continue
+        for name in nv.splitlines():
+            s = name.strip().strip(".").lower()
+            if not s:
+                continue
+            if s.startswith("*."):
+                s = s[2:]
+            if s == d:
+                continue
+            if not s.endswith("." + d):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                return out
     return out
 
 
@@ -910,6 +1354,45 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
         title = str(r.get("title") or "").strip()
         if title:
             print(f"    {term.gray('title:')} {term.violet(_truncate_middle(title, max(40, width - 16)))}")
+        params = r.get("params")
+        if isinstance(params, dict):
+            names = params.get("param_names")
+            urls = params.get("urls_with_params")
+            hidden = params.get("hidden_fields")
+            if isinstance(names, list) and names:
+                disp = ", ".join([term.cyan(n, bold=True) for n in names[:18]])
+                more = ""
+                try:
+                    total = int(params.get("count_params") or len(names))
+                except Exception:
+                    total = len(names)
+                if total > len(names):
+                    total = len(names)
+                if total > 18:
+                    more = term.gray(f" +{total - 18} lagi")
+                print(f"    {term.gray('params:')} {disp}{more}")
+            if isinstance(hidden, list) and hidden:
+                parts: List[str] = []
+                shown = 0
+                for pair in hidden[:10]:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        continue
+                    k = str(pair[0] or "").strip()
+                    v = str(pair[1] or "").strip()
+                    if not k or not v:
+                        continue
+                    shown += 1
+                    parts.append(term.violet(k, bold=True) + term.gray("=") + term.gray(_truncate_middle(v, 40)))
+                if parts:
+                    more = term.gray(f" +{max(0, len(hidden) - shown)} lagi") if len(hidden) > shown else ""
+                    print(f"    {term.gray('hidden:')} " + ", ".join(parts) + more)
+            if isinstance(urls, list) and urls:
+                print(f"    {term.gray('urls:')} {term.gray('contoh parameter aktif')}")
+                for u in urls[:4]:
+                    su = str(u or "")
+                    if not su:
+                        continue
+                    print(f"      {term.bullet()} {term.link(_truncate_middle(su, max(60, width - 12)), su)}")
         server = str(r.get("server") or "").strip()
         powered = str(r.get("powered_by") or "").strip()
         ctype = str(r.get("content_type") or "").strip()
@@ -947,6 +1430,49 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
             names = [str(v) for (t, v) in san if str(t) == "DNS" and str(v)]
             if names:
                 print(f"  {term.bullet()} {term.gray('san:')} " + term.gray(_truncate_middle(", ".join(names[:20]), max(50, width - 10))))
+
+    crawl = http_data.get("crawl") if isinstance(http_data, dict) else None
+    if isinstance(crawl, dict):
+        pages_ok = int(crawl.get("pages_ok") or 0)
+        pages_err = int(crawl.get("pages_err") or 0)
+        pnames = crawl.get("param_names")
+        urls = crawl.get("urls_with_params")
+        hidden = crawl.get("hidden_fields")
+        if pages_ok or pages_err or pnames or urls or hidden:
+            print("")
+            print(term.tag("PARAMS", color="violet") + term.dim("  ") + term.gray(f"crawl {pages_ok} ok / {pages_err} err"))
+            if isinstance(pnames, list) and pnames:
+                disp = ", ".join([term.cyan(str(n), bold=True) for n in pnames[:26] if str(n or "").strip()])
+                more = ""
+                try:
+                    total = int(crawl.get("count_params") or len(pnames))
+                except Exception:
+                    total = len(pnames)
+                if total > 26:
+                    more = term.gray(f" +{total - 26} lagi")
+                print(f"  {term.bullet()} {term.gray('names:')} {disp}{more}")
+            if isinstance(hidden, list) and hidden:
+                parts: List[str] = []
+                shown = 0
+                for pair in hidden[:12]:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        continue
+                    k = str(pair[0] or "").strip()
+                    v = str(pair[1] or "").strip()
+                    if not k or not v:
+                        continue
+                    shown += 1
+                    parts.append(term.violet(k, bold=True) + term.gray("=") + term.gray(_truncate_middle(v, 50)))
+                if parts:
+                    more = term.gray(f" +{max(0, len(hidden) - shown)} lagi") if len(hidden) > shown else ""
+                    print(f"  {term.bullet()} {term.gray('hidden:')} " + ", ".join(parts) + more)
+            if isinstance(urls, list) and urls:
+                print(f"  {term.bullet()} {term.gray('urls:')} {term.gray('contoh URL ber-parameter')}")
+                for u in urls[: min(8, len(urls))]:
+                    su = str(u or "").strip()
+                    if not su:
+                        continue
+                    print(f"    {term.bullet()} {term.link(_truncate_middle(su, max(70, width - 10)), su)}")
 
 
 def geo_ip_api_com(ip: str, timeout_s: float) -> Optional[GeoResult]:
@@ -1702,8 +2228,19 @@ def run_scan(
     rdap_timeout_s: float,
     http_recon: bool,
     tls_recon: bool,
+    params_recon: bool,
+    params_limit: int,
+    params_url_limit: int,
+    crawl: bool,
+    crawl_pages: int,
+    crawl_depth: int,
+    crawl_bytes: int,
     dns_extra: bool,
     max_related: int,
+    ct_subdomains: bool,
+    ct_limit: int,
+    ct_resolve_limit: int,
+    ct_timeout_s: float,
     interactive: bool,
     state: Optional[LiveMapState],
 ) -> Tuple[int, int, int]:
@@ -1718,6 +2255,31 @@ def run_scan(
                 host = parsed.hostname or t
             info = dns_lookup_all(host, dns_servers=dns_servers, timeout_s=timeout_s)
             print_domain_info(host, info, dns_servers=dns_servers, timeout_s=timeout_s, term=term)
+            if ct_subdomains:
+                subs = ct_fetch_subdomains(host, timeout_s=float(ct_timeout_s), limit=int(ct_limit))
+                count = len(subs)
+                head = f"CT logs ({count} found)" if count else "CT logs (0 found / diblok rate-limit / target tidak ada di CT)"
+                print(term.tag("SUBDOMAINS", color="violet") + term.dim("  ") + term.gray(head))
+                if subs:
+                    no_ip = 0
+                    shown_no_ip = 0
+                    for sub in subs[: max(0, int(ct_resolve_limit))]:
+                        ips_sub = dns_lookup_ips(sub, dns_servers=dns_servers, timeout_s=timeout_s)
+                        sub_disp = term.violet(term.link(sub, url_whois_domain(sub)), bold=True)
+                        if ips_sub:
+                            ip_join = ", ".join([term.cyan(term.link(ip, url_ipinfo(ip))) for ip in ips_sub])
+                            print(f"  {term.bullet()} {sub_disp} {term.gray('->')} {ip_join}")
+                            for ip in ips_sub:
+                                resolved.append((sub, ip))
+                        else:
+                            no_ip += 1
+                            if shown_no_ip < 10:
+                                shown_no_ip += 1
+                                print(f"  {term.bullet()} {sub_disp} {term.gray('->')} {term.gray('no A/AAAA')}")
+                    if no_ip > shown_no_ip:
+                        print(f"  {term.bullet()} {term.gray('...')} {term.gray(f'{no_ip - shown_no_ip} subdomain lain no A/AAAA (disembunyikan)')}")
+                    if len(subs) > int(ct_resolve_limit):
+                        print(f"  {term.bullet()} {term.gray('...')} {term.gray(f'+{len(subs) - int(ct_resolve_limit)} lainnya (naikkan --ct-resolve)')}")
             related = _extract_hosts_from_dns_info(host, info)
             if related:
                 print(term.tag("RELATED", color="cyan") + term.dim("  ") + term.gray("NS/MX/CNAME/WWW"))
@@ -1757,7 +2319,17 @@ def run_scan(
                         for ip in ips_e:
                             resolved.append((hn, ip))
             if http_recon:
-                http_data = http_probe(host, timeout_s=timeout_s)
+                http_data = http_probe(
+                    host,
+                    timeout_s=timeout_s,
+                    params=params_recon,
+                    params_limit=int(params_limit),
+                    params_url_limit=int(params_url_limit),
+                    crawl=bool(crawl),
+                    crawl_pages=int(crawl_pages),
+                    crawl_depth=int(crawl_depth),
+                    crawl_bytes=int(crawl_bytes),
+                )
                 tls_data = tls_probe(host, timeout_s=timeout_s) if tls_recon else None
                 print_http_block(host, http_data, tls_data, term)
             ips = info.get("A", []) + info.get("AAAA", [])
@@ -1966,11 +2538,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=6.0, help="Timeout request GeoIP (detik)")
     p.add_argument("-w", "--workers", type=int, default=12, help="Jumlah worker paralel untuk lookup")
     p.add_argument("--dns", default="1.1.1.1,8.8.8.8", help="DNS server (comma-separated). Default: 1.1.1.1,8.8.8.8")
+    p.add_argument("--subs-file", help="File daftar subdomain/FQDN (satu per baris) untuk ikut di-scan")
+    p.add_argument("--ct", action="store_true", help="Cari subdomain secara pasif dari Certificate Transparency (crt.sh)")
+    p.add_argument("--ct-timeout", type=float, default=12.0, help="Timeout request CT (detik)")
+    p.add_argument("--ct-limit", type=int, default=250, help="Batas jumlah subdomain dari CT (default: 250)")
+    p.add_argument("--ct-resolve", type=int, default=120, help="Batas subdomain CT yang di-resolve ke IP (default: 120)")
     p.add_argument("--rdap", action="store_true", help="Tampilkan output IP WHOIS via RDAP (lebih lengkap)")
     p.add_argument("--rdap-timeout", type=float, default=8.0, help="Timeout request RDAP (detik)")
     p.add_argument("--no-auto-rdap", action="store_true", help="Matikan auto-RDAP saat scan domain (default: aktif untuk 1 target domain)")
     p.add_argument("--dns-extra", action="store_true", help="Tambah cek DNS tambahan (DMARC/MTA-STS/TLS-RPT, dll)")
     p.add_argument("--http", action="store_true", help="Tambah recon HTTP (status, redirect, headers, title)")
+    p.add_argument("--params", action="store_true", help="Cari parameter secara pasif dari HTML (query params + nama field form) saat --http aktif")
+    p.add_argument("--params-limit", type=int, default=120, help="Batas jumlah parameter unik yang ditampilkan (default: 120)")
+    p.add_argument("--params-urls", type=int, default=20, help="Batas jumlah URL contoh yang berisi parameter (default: 20)")
+    p.add_argument("--crawl", action="store_true", help="Crawl ringan same-host untuk mengumpulkan URL/parameter (pasif, GET saja)")
+    p.add_argument("--crawl-pages", type=int, default=12, help="Batas halaman crawl (default: 12)")
+    p.add_argument("--crawl-depth", type=int, default=1, help="Kedalaman crawl (default: 1)")
+    p.add_argument("--crawl-bytes", type=int, default=250000, help="Batas byte per halaman crawl (default: 250000)")
     p.add_argument("--tls", action="store_true", help="Tambah recon TLS cert (butuh --http atau scan domain)")
     p.add_argument("--max-related", type=int, default=20, help="Batas host RELATED yang di-resolve (default: 20)")
     p.add_argument("--full", action="store_true", help="Mode lengkap (setara: --rdap --menu)")
@@ -2003,6 +2587,17 @@ def main() -> int:
         except OSError as e:
             print(term.bad("Gagal baca file: ") + str(e))
             return 2
+    if args.subs_file:
+        try:
+            subs = read_targets_from_file(args.subs_file)
+        except OSError as e:
+            print(term.bad("Gagal baca subs-file: ") + str(e))
+            return 2
+        for s in subs:
+            ss = (s or "").strip()
+            if not ss or ss.startswith("#"):
+                continue
+            targets.append(ss)
 
     targets = [t for t in targets if t.strip()]
     if not targets:
@@ -2046,8 +2641,11 @@ def main() -> int:
         rdap_on = bool(args.rdap) or full_on or auto_rdap
         menu_on = bool(args.menu) or full_on
         dns_extra_on = bool(args.dns_extra) or full_on
-        http_on = bool(args.http) or full_on
+        http_on = bool(args.http) or bool(args.params) or full_on
         tls_on = bool(args.tls) or full_on
+        ct_on = bool(args.ct) or (full_on and len(targets) == 1 and is_domain_like(targets[0]))
+        params_on = bool(args.params) or full_on
+        crawl_on = bool(args.crawl) or full_on
         run_scan(
             targets,
             provider=args.provider,
@@ -2059,8 +2657,19 @@ def main() -> int:
             rdap_timeout_s=float(args.rdap_timeout),
             http_recon=http_on,
             tls_recon=tls_on,
+            params_recon=params_on,
+            params_limit=int(args.params_limit),
+            params_url_limit=int(args.params_urls),
+            crawl=crawl_on and http_on and params_on,
+            crawl_pages=int(args.crawl_pages),
+            crawl_depth=int(args.crawl_depth),
+            crawl_bytes=int(args.crawl_bytes),
             dns_extra=dns_extra_on,
             max_related=int(args.max_related),
+            ct_subdomains=ct_on,
+            ct_limit=int(args.ct_limit),
+            ct_resolve_limit=int(args.ct_resolve),
+            ct_timeout_s=float(args.ct_timeout),
             interactive=menu_on,
             state=state,
         )
