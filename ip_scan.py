@@ -928,6 +928,92 @@ def _normalize_candidate_url(candidate: str, base: str) -> str:
         return ""
 
 
+def _extract_from_js_text(js_text: str, *, base_url: str, same_host: str, url_limit: int, param_limit: int) -> Dict[str, Any]:
+    url_limit = max(1, min(int(url_limit), 200))
+    param_limit = max(1, min(int(param_limit), 500))
+    js = str(js_text or "")
+    urls_with_params: List[str] = []
+    endpoints: List[str] = []
+    seen_urls: Set[str] = set()
+    seen_eps: Set[str] = set()
+    params: Set[str] = set()
+
+    def good_param_name(s: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]{0,39}", s or ""))
+
+    def good_path(path: str) -> bool:
+        p = str(path or "")
+        if not p.startswith("/"):
+            return False
+        if len(p) > 160:
+            return False
+        if any(x in p for x in (" ", "\t", "\r", "\n", "(", ")", "{", "}", "<", ">", "\\")):
+            return False
+        return True
+
+    def iter_url_candidates(blob: str) -> Iterable[str]:
+        for m in re.finditer(r"""["'`]((?:https?://|/)[^"'`\\s<>]{1,240})["'`]""", blob):
+            yield m.group(1)
+
+    for u in iter_url_candidates(js):
+        full = _normalize_candidate_url(u, base_url)
+        if not full:
+            continue
+        try:
+            parts = urllib.parse.urlsplit(full)
+        except Exception:
+            continue
+        if parts.scheme not in ("http", "https"):
+            continue
+        if parts.hostname and parts.hostname.lower() != same_host.lower():
+            continue
+        if parts.query:
+            pnames = _extract_param_names_from_url(full)
+            if pnames:
+                for pn in pnames:
+                    if good_param_name(pn):
+                        params.add(pn)
+                if full not in seen_urls and len(urls_with_params) < url_limit:
+                    seen_urls.add(full)
+                    urls_with_params.append(full)
+        else:
+            if good_path(parts.path or "/"):
+                ep = _crawl_normalize(full)
+                if ep and ep not in seen_eps:
+                    seen_eps.add(ep)
+                    endpoints.append(ep)
+        if len(params) >= param_limit and len(urls_with_params) >= url_limit:
+            break
+
+    for pat in [
+        r"""\b(?:append|set|get)\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*,""",
+        r"""\bgetParameter\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*\)""",
+        r"""\bURLSearchParams\([^)]*\)\.get\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*\)""",
+        r"""\bURLSearchParams\([^)]*\)\.set\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*,""",
+    ]:
+        for m in re.finditer(pat, js):
+            if len(params) >= param_limit:
+                break
+            kk = str(m.group(1) or "").strip()
+            if kk and good_param_name(kk):
+                params.add(kk)
+
+    rx = re.findall(r"[?&]([A-Za-z0-9_\\-]{1,60})=", js)
+    for k in rx[: max(0, param_limit * 2)]:
+        if len(params) >= param_limit:
+            break
+        kk = str(k or "").strip()
+        if kk and good_param_name(kk):
+            params.add(kk)
+
+    return {
+        "param_names": sorted(params)[:param_limit],
+        "urls_with_params": urls_with_params[:url_limit],
+        "endpoints": endpoints[: max(10, min(200, url_limit * 2))],
+        "count_params": len(params),
+    }
+
+
 def _should_enqueue_crawl(url: str, *, same_host: str) -> bool:
     try:
         parts = urllib.parse.urlsplit(url)
@@ -993,6 +1079,8 @@ def http_crawl_params(
     max_bytes: int,
     params_url_limit: int,
     params_limit: int,
+    delay_s: float,
+    js_fetch_limit: int,
 ) -> Dict[str, Any]:
     max_pages = max(1, min(int(max_pages), 200))
     max_depth = max(0, min(int(max_depth), 3))
@@ -1012,9 +1100,12 @@ def http_crawl_params(
     hidden_fields: List[Tuple[str, str]] = []
     pages_ok = 0
     pages_err = 0
+    js_fetched = 0
 
     while q and (pages_ok + pages_err) < max_pages:
         cur, depth = q.pop(0)
+        if delay_s > 0:
+            time.sleep(delay_s)
         try:
             status, final_url, headers, body = _try_http_request_limited(cur, timeout_s, max_bytes=max_bytes)
         except Exception:
@@ -1080,6 +1171,64 @@ def http_crawl_params(
             parser.feed(text)
         except Exception:
             continue
+        if js_fetch_limit > 0 and js_fetched < js_fetch_limit:
+            js_urls: List[str] = []
+            for u in parser.urls[:800]:
+                full = _normalize_candidate_url(u, base)
+                if not full:
+                    continue
+                try:
+                    parts = urllib.parse.urlsplit(full)
+                except Exception:
+                    continue
+                if parts.scheme not in ("http", "https"):
+                    continue
+                if parts.hostname and parts.hostname.lower() != host.lower():
+                    continue
+                if not (parts.path or "").lower().endswith(".js"):
+                    continue
+                js_urls.append(full)
+                if len(js_urls) >= 6:
+                    break
+            for ju in js_urls:
+                if js_fetched >= js_fetch_limit:
+                    break
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                try:
+                    status2, final2, headers2, body2 = _try_http_request_limited(ju, timeout_s, max_bytes=min(400_000, max_bytes))
+                except Exception:
+                    continue
+                if status2 and status2 >= 400:
+                    continue
+                ctype2 = str(headers2.get("Content-Type") or "").lower()
+                if "javascript" not in ctype2 and not (ju.lower().endswith(".js")):
+                    continue
+                js_fetched += 1
+                js_text = body2.decode("utf-8", errors="replace")
+                js_pack = _extract_from_js_text(js_text, base_url=final2 or ju, same_host=host, url_limit=max(10, int(params_url_limit)), param_limit=max(50, int(params_limit)))
+                jn = js_pack.get("param_names")
+                if isinstance(jn, list):
+                    for n in jn:
+                        nn = str(n or "").strip()
+                        if nn:
+                            all_params.add(nn)
+                            if len(all_params) >= int(params_limit):
+                                break
+                je = js_pack.get("endpoints")
+                if isinstance(je, list):
+                    for e in je[:400]:
+                        ee = str(e or "").strip()
+                        if ee:
+                            all_endpoints.add(ee)
+                            if len(all_endpoints) >= 800:
+                                break
+                juw = js_pack.get("urls_with_params")
+                if isinstance(juw, list):
+                    for u in juw:
+                        su = str(u or "").strip()
+                        if su and len(urls_with_params) < int(params_url_limit):
+                            urls_with_params.append(su)
         for u in parser.urls[:500]:
             full = _normalize_candidate_url(u, base)
             if not full:
@@ -1118,6 +1267,7 @@ def http_crawl_params(
     return {
         "pages_ok": pages_ok,
         "pages_err": pages_err,
+        "js_fetched": js_fetched,
         "param_names": sorted(all_params)[: int(params_limit)],
         "count_params": len(all_params),
         "urls_with_params": uniq_urls,
@@ -1130,6 +1280,8 @@ def http_crawl_params(
 def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, url_limit: int, param_limit: int) -> Dict[str, Any]:
     url_limit = max(1, min(int(url_limit), 200))
     param_limit = max(1, min(int(param_limit), 500))
+    def good_param_name(s: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-\[\]\.]{0,59}", s or ""))
     parser = _HTMLParamExtractor()
     try:
         parser.feed(html_text)
@@ -1161,7 +1313,9 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
                 endpoints.append(ep)
         pnames = _extract_param_names_from_url(full)
         if pnames:
-            params |= pnames
+            for pn in pnames:
+                if good_param_name(pn):
+                    params.add(pn)
             if full not in seen_urls and len(urls_with_params) < url_limit:
                 seen_urls.add(full)
                 urls_with_params.append(full)
@@ -1170,7 +1324,7 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
 
     for name in list(parser.form_fields):
         nn = str(name or "").strip()
-        if nn:
+        if nn and good_param_name(nn):
             params.add(nn)
         if len(params) >= param_limit:
             break
@@ -1180,7 +1334,7 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
         if len(params) >= param_limit:
             break
         kk = str(k or "").strip()
-        if kk:
+        if kk and good_param_name(kk):
             params.add(kk)
 
     hidden_pairs: List[Tuple[str, str]] = []
@@ -1189,50 +1343,39 @@ def _extract_params_passive(html_text: str, *, base_url: str, same_host: str, ur
         vv = str(v or "").strip()
         if not kk or not vv:
             continue
-        params.add(kk)
+        if good_param_name(kk):
+            params.add(kk)
         hidden_pairs.append((kk, _truncate_middle(vv, 120)))
         if len(hidden_pairs) >= 60:
             break
 
     js = parser.script_text()
     if js:
-        for u in re.findall(r"""(?:(?:https?://)[^"'\\s<>]{1,240}|(?:/)[^"'\\s<>]{1,240})""", js):
-            full = _normalize_candidate_url(u, base_url)
-            if not full:
-                continue
-            try:
-                parts = urllib.parse.urlsplit(full)
-            except Exception:
-                continue
-            if parts.scheme not in ("http", "https"):
-                continue
-            if parts.hostname and parts.hostname.lower() != same_host.lower():
-                continue
-            if not parts.query:
-                ep = _crawl_normalize(full)
-                if ep and ep not in seen_endpoints:
-                    seen_endpoints.add(ep)
-                    endpoints.append(ep)
-            pnames = _extract_param_names_from_url(full)
-            if pnames:
-                params |= pnames
-                if full not in seen_urls and len(urls_with_params) < url_limit:
-                    seen_urls.add(full)
-                    urls_with_params.append(full)
-            if len(params) >= param_limit and len(urls_with_params) >= url_limit:
-                break
-
-        for pat in [
-            r"""\b(?:append|set|get)\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*,""",
-            r"""\bgetParameter\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*\)""",
-            r"""\bURLSearchParams\([^)]*\)\.get\(\s*["']([A-Za-z0-9_\-]{1,60})["']\s*\)""",
-        ]:
-            for m in re.finditer(pat, js):
-                if len(params) >= param_limit:
-                    break
-                kk = str(m.group(1) or "").strip()
-                if kk:
-                    params.add(kk)
+        pack = _extract_from_js_text(js, base_url=base_url, same_host=same_host, url_limit=url_limit, param_limit=param_limit)
+        p2 = pack.get("param_names")
+        if isinstance(p2, list):
+            for pn in p2:
+                sp = str(pn or "").strip()
+                if sp and good_param_name(sp):
+                    params.add(sp)
+                    if len(params) >= param_limit:
+                        break
+        u2 = pack.get("urls_with_params")
+        if isinstance(u2, list):
+            for u in u2:
+                su = str(u or "").strip()
+                if su and su not in seen_urls and len(urls_with_params) < url_limit:
+                    seen_urls.add(su)
+                    urls_with_params.append(su)
+        e2 = pack.get("endpoints")
+        if isinstance(e2, list):
+            for e in e2:
+                se = str(e or "").strip()
+                if se and se not in seen_endpoints:
+                    seen_endpoints.add(se)
+                    endpoints.append(se)
+                    if len(endpoints) >= max(10, min(200, url_limit * 2)):
+                        break
 
     return {
         "param_names": sorted(params)[:param_limit],
@@ -1255,12 +1398,17 @@ def http_probe(
     crawl_pages: int,
     crawl_depth: int,
     crawl_bytes: int,
+    delay_s: float,
+    js_fetch_limit: int,
+    js_fetch_bytes: int,
 ) -> Dict[str, Any]:
     out: Dict[str, Any] = {"host": host, "results": []}
     schemes = ["https", "http"]
     seed_urls: List[str] = []
     for sch in schemes:
         url = f"{sch}://{host}/"
+        if delay_s > 0:
+            time.sleep(delay_s)
         try:
             status, final_url, headers, body = _try_http_request(url, timeout_s)
             text = body.decode("utf-8", errors="replace")
@@ -1285,15 +1433,80 @@ def http_probe(
                 "permissions": headers.get("Permissions-Policy", ""),
                 "title": title,
             }
+            waf, sigs = detect_waf(headers, text)
+            if waf:
+                row["waf"] = {"vendor": waf, "signals": sigs[:6]}
             if params:
                 base = final_url or url
-                row["params"] = _extract_params_passive(
+                pack = _extract_params_passive(
                     text,
                     base_url=base,
                     same_host=host,
                     url_limit=int(params_url_limit),
                     param_limit=int(params_limit),
                 )
+                if js_fetch_limit > 0:
+                    parser = _HTMLParamExtractor()
+                    try:
+                        parser.feed(text)
+                    except Exception:
+                        parser = _HTMLParamExtractor()
+                    js_urls: List[str] = []
+                    for u in parser.urls[:900]:
+                        full = _normalize_candidate_url(u, base)
+                        if not full:
+                            continue
+                        try:
+                            parts = urllib.parse.urlsplit(full)
+                        except Exception:
+                            continue
+                        if parts.scheme not in ("http", "https"):
+                            continue
+                        if parts.hostname and parts.hostname.lower() != host.lower():
+                            continue
+                        if not (parts.path or "").lower().endswith(".js"):
+                            continue
+                        js_urls.append(full)
+                        if len(js_urls) >= int(js_fetch_limit):
+                            break
+                    for ju in js_urls:
+                        if delay_s > 0:
+                            time.sleep(delay_s)
+                        try:
+                            st2, fu2, hd2, bd2 = _try_http_request_limited(ju, timeout_s, max_bytes=int(js_fetch_bytes))
+                        except Exception:
+                            continue
+                        if st2 and st2 >= 400:
+                            continue
+                        js_text = bd2.decode("utf-8", errors="replace")
+                        js_pack = _extract_from_js_text(
+                            js_text,
+                            base_url=fu2 or ju,
+                            same_host=host,
+                            url_limit=int(params_url_limit),
+                            param_limit=int(params_limit),
+                        )
+                        for k in ("param_names", "urls_with_params", "endpoints"):
+                            a = pack.get(k)
+                            b = js_pack.get(k)
+                            if isinstance(a, list) and isinstance(b, list):
+                                merged = []
+                                seen = set()
+                                for it in a + b:
+                                    s = str(it or "").strip()
+                                    if not s:
+                                        continue
+                                    if s in seen:
+                                        continue
+                                    seen.add(s)
+                                    merged.append(s)
+                                    if k == "param_names" and len(merged) >= int(params_limit):
+                                        break
+                                    if k != "param_names" and len(merged) >= int(params_url_limit):
+                                        break
+                                pack[k] = merged
+                        pack["js_files"] = js_urls[: int(js_fetch_limit)]
+                row["params"] = pack
             out["results"].append(row)
             if status and 200 <= status < 400:
                 seed_urls.append(final_url or url)
@@ -1311,6 +1524,8 @@ def http_probe(
             max_bytes=int(crawl_bytes),
             params_url_limit=int(params_url_limit),
             params_limit=int(params_limit),
+            delay_s=float(delay_s),
+            js_fetch_limit=max(0, int(js_fetch_limit) * 2),
         )
     return out
 
@@ -1367,6 +1582,179 @@ def ct_fetch_subdomains(domain: str, *, timeout_s: float, limit: int) -> List[st
     return out
 
 
+def certspotter_fetch_subdomains(domain: str, *, timeout_s: float, limit: int) -> List[str]:
+    d = domain.strip().strip(".").lower()
+    if not d or "." not in d:
+        return []
+    limit = max(1, min(int(limit), 5000))
+    url = (
+        "https://api.certspotter.com/v1/issuances?"
+        + urllib.parse.urlencode(
+            {
+                "domain": d,
+                "include_subdomains": "true",
+                "expand": "dns_names",
+            }
+        )
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "IP-SCAN/1.0 (+terminal)",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read(6_000_000)
+    except Exception:
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[str] = []
+    seen: Set[str] = set()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        dns_names = row.get("dns_names")
+        if not isinstance(dns_names, list):
+            continue
+        for name in dns_names:
+            s = str(name or "").strip().strip(".").lower()
+            if not s:
+                continue
+            if s.startswith("*."):
+                s = s[2:]
+            if s == d:
+                continue
+            if not s.endswith("." + d):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def detect_waf(headers: Dict[str, str], body_text: str) -> Tuple[str, List[str]]:
+    h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    b = (body_text or "")[:40_000].lower()
+    signals: List[str] = []
+
+    def has_header(name: str) -> bool:
+        return name.lower() in h and bool(h.get(name.lower(), "").strip())
+
+    if has_header("cf-ray") or has_header("cf-cache-status") or "cloudflare" in h.get("server", "").lower():
+        signals.append("cloudflare-header")
+    if "akamai" in h.get("server", "").lower() or has_header("x-akamai-transformed") or has_header("akamai-ghost"):
+        signals.append("akamai-header")
+    if has_header("x-iinfo") or "incap_ses" in h.get("set-cookie", "").lower() or "visid_incap" in h.get("set-cookie", "").lower():
+        signals.append("imperva-header")
+    if "sucuri" in h.get("server", "").lower() or has_header("x-sucuri-id") or has_header("x-sucuri-cache"):
+        signals.append("sucuri-header")
+    if "f5" in h.get("server", "").lower() or has_header("x-waf-event"):
+        signals.append("f5-header")
+
+    if "attention required" in b and "cloudflare" in b:
+        signals.append("cloudflare-body")
+    if "access denied" in b and "akamai" in b:
+        signals.append("akamai-body")
+    if "incident id" in b and "incapsula" in b:
+        signals.append("imperva-body")
+    if "sucuri website firewall" in b:
+        signals.append("sucuri-body")
+
+    if any("cloudflare" in s for s in signals):
+        return "Cloudflare", signals
+    if any("akamai" in s for s in signals):
+        return "Akamai", signals
+    if any("imperva" in s for s in signals):
+        return "Imperva/Incapsula", signals
+    if any("sucuri" in s for s in signals):
+        return "Sucuri", signals
+    if any("f5" in s for s in signals):
+        return "F5", signals
+    return "", []
+
+
+def web_discovery(host: str, *, timeout_s: float, delay_s: float) -> Dict[str, Any]:
+    def fetch_text(path: str, max_bytes: int) -> str:
+        url = f"https://{host}{path}"
+        try:
+            status, final_url, headers, body = _try_http_request_limited(url, timeout_s, max_bytes=max_bytes)
+            if status and status >= 400:
+                return ""
+            ctype = str(headers.get("Content-Type") or "").lower()
+            if "text" not in ctype and "xml" not in ctype and "html" not in ctype and "json" not in ctype:
+                return ""
+            return body.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    out: Dict[str, Any] = {"host": host, "robots": [], "sitemaps": [], "security_txt": "", "paths": []}
+    if delay_s > 0:
+        time.sleep(delay_s)
+    robots = fetch_text("/robots.txt", 120_000)
+    if robots:
+        out["robots"] = robots.splitlines()[:500]
+        for line in robots.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            low = s.lower()
+            if low.startswith("sitemap:"):
+                sm = s.split(":", 1)[1].strip()
+                if sm:
+                    out["sitemaps"].append(sm)
+            if low.startswith("disallow:") or low.startswith("allow:"):
+                p = s.split(":", 1)[1].strip()
+                if p and p.startswith("/"):
+                    out["paths"].append(p)
+    if delay_s > 0:
+        time.sleep(delay_s)
+    smxml = fetch_text("/sitemap.xml", 500_000)
+    if smxml:
+        locs = re.findall(r"<loc>([^<]{1,500})</loc>", smxml, flags=re.IGNORECASE)
+        for loc in locs[:400]:
+            u = str(loc or "").strip()
+            if not u:
+                continue
+            try:
+                parts = urllib.parse.urlsplit(u)
+            except Exception:
+                continue
+            if parts.hostname and parts.hostname.lower() == host.lower():
+                if parts.path:
+                    out["paths"].append(parts.path)
+    if delay_s > 0:
+        time.sleep(delay_s)
+    sec = fetch_text("/.well-known/security.txt", 120_000)
+    if sec:
+        out["security_txt"] = sec
+
+    uniq: List[str] = []
+    seen: Set[str] = set()
+    for p in out.get("paths") or []:
+        sp = str(p or "").strip()
+        if not sp.startswith("/"):
+            continue
+        if sp in seen:
+            continue
+        seen.add(sp)
+        uniq.append(sp)
+        if len(uniq) >= 200:
+            break
+    out["paths"] = uniq
+    out["sitemaps"] = out.get("sitemaps", [])[:10]
+    return out
+
 def tls_probe(host: str, timeout_s: float) -> Dict[str, Any]:
     out: Dict[str, Any] = {"host": host, "ok": False}
     ctx = ssl.create_default_context()
@@ -1411,6 +1799,14 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
         if final_url and final_url != url:
             line += term.gray(" :: ") + term.link(_truncate_middle(final_url, 80), final_url)
         print(line)
+        waf = r.get("waf")
+        if isinstance(waf, dict) and str(waf.get("vendor") or "").strip():
+            vendor = str(waf.get("vendor") or "").strip()
+            sigs = waf.get("signals")
+            extra = ""
+            if isinstance(sigs, list) and sigs:
+                extra = term.gray(" (") + term.gray(", ".join([str(x) for x in sigs[:3] if str(x)])) + term.gray(")")
+            print(f"    {term.gray('waf:')} {term.warn(vendor)}{extra}")
         title = str(r.get("title") or "").strip()
         if title:
             print(f"    {term.gray('title:')} {term.violet(_truncate_middle(title, max(40, width - 16)))}")
@@ -1420,6 +1816,7 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
             urls = params.get("urls_with_params")
             eps = params.get("endpoints")
             hidden = params.get("hidden_fields")
+            js_files = params.get("js_files")
             if isinstance(names, list) and names:
                 disp = ", ".join([term.cyan(n, bold=True) for n in names[:18]])
                 more = ""
@@ -1432,6 +1829,8 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
                 if total > 18:
                     more = term.gray(f" +{total - 18} lagi")
                 print(f"    {term.gray('params:')} {disp}{more}")
+            if isinstance(js_files, list) and js_files:
+                print(f"    {term.gray('js:')} {term.gray(f'{len(js_files)} file')} " + term.gray(_truncate_middle(", ".join([str(x) for x in js_files[:3]]), max(50, width - 18))))
             if isinstance(hidden, list) and hidden:
                 parts: List[str] = []
                 shown = 0
@@ -1506,13 +1905,17 @@ def print_http_block(host: str, http_data: Dict[str, Any], tls_data: Optional[Di
     if isinstance(crawl, dict):
         pages_ok = int(crawl.get("pages_ok") or 0)
         pages_err = int(crawl.get("pages_err") or 0)
+        js_fetched = int(crawl.get("js_fetched") or 0)
         pnames = crawl.get("param_names")
         urls = crawl.get("urls_with_params")
         hidden = crawl.get("hidden_fields")
         eps = crawl.get("endpoints")
         if pages_ok or pages_err or pnames or urls or hidden:
             print("")
-            print(term.tag("PARAMS", color="violet") + term.dim("  ") + term.gray(f"crawl {pages_ok} ok / {pages_err} err"))
+            head = f"crawl {pages_ok} ok / {pages_err} err"
+            if js_fetched:
+                head += f" / js {js_fetched}"
+            print(term.tag("PARAMS", color="violet") + term.dim("  ") + term.gray(head))
             if isinstance(pnames, list) and pnames:
                 disp = ", ".join([term.cyan(str(n), bold=True) for n in pnames[:26] if str(n or "").strip()])
                 more = ""
@@ -2314,6 +2717,9 @@ def run_scan(
     crawl_pages: int,
     crawl_depth: int,
     crawl_bytes: int,
+    delay_s: float,
+    sub_sources: str,
+    web_recon: bool,
     dns_extra: bool,
     max_related: int,
     ct_subdomains: bool,
@@ -2335,14 +2741,37 @@ def run_scan(
             info = dns_lookup_all(host, dns_servers=dns_servers, timeout_s=timeout_s)
             print_domain_info(host, info, dns_servers=dns_servers, timeout_s=timeout_s, term=term)
             if ct_subdomains:
-                subs = ct_fetch_subdomains(host, timeout_s=float(ct_timeout_s), limit=int(ct_limit))
-                count = len(subs)
-                head = f"CT logs ({count} found)" if count else "CT logs (0 found / diblok rate-limit / target tidak ada di CT)"
-                print(term.tag("SUBDOMAINS", color="violet") + term.dim("  ") + term.gray(head))
-                if subs:
+                sources = [s.strip().lower() for s in str(sub_sources or "").split(",") if s.strip()]
+                if not sources:
+                    sources = ["ct"]
+                if "ct" not in sources and "certspotter" not in sources:
+                    sources = ["ct"]
+                by_src: Dict[str, List[str]] = {}
+                all_subs: List[str] = []
+                for src in sources:
+                    if src == "ct":
+                        by_src["ct"] = ct_fetch_subdomains(host, timeout_s=float(ct_timeout_s), limit=int(ct_limit))
+                    elif src in ("certspotter", "cs"):
+                        by_src["certspotter"] = certspotter_fetch_subdomains(host, timeout_s=float(ct_timeout_s), limit=int(ct_limit))
+                seen_sub: Set[str] = set()
+                for src, lst in by_src.items():
+                    for sub in lst:
+                        ssub = str(sub or "").strip().strip(".").lower()
+                        if not ssub:
+                            continue
+                        if ssub in seen_sub:
+                            continue
+                        seen_sub.add(ssub)
+                        all_subs.append(ssub)
+                head = " / ".join([f"{k}:{len(v)}" for k, v in by_src.items()]) if by_src else ""
+                if all_subs:
+                    print(term.tag("SUBDOMAINS", color="violet") + term.dim("  ") + term.gray(f"{len(all_subs)} found ({head})"))
+                else:
+                    print(term.tag("SUBDOMAINS", color="violet") + term.dim("  ") + term.gray("0 found / rate-limit / tidak ada data publik"))
+                if all_subs:
                     no_ip = 0
                     shown_no_ip = 0
-                    for sub in subs[: max(0, int(ct_resolve_limit))]:
+                    for sub in all_subs[: max(0, int(ct_resolve_limit))]:
                         ips_sub = dns_lookup_ips(sub, dns_servers=dns_servers, timeout_s=timeout_s)
                         sub_disp = term.violet(term.link(sub, url_whois_domain(sub)), bold=True)
                         if ips_sub:
@@ -2357,8 +2786,8 @@ def run_scan(
                                 print(f"  {term.bullet()} {sub_disp} {term.gray('->')} {term.gray('no A/AAAA')}")
                     if no_ip > shown_no_ip:
                         print(f"  {term.bullet()} {term.gray('...')} {term.gray(f'{no_ip - shown_no_ip} subdomain lain no A/AAAA (disembunyikan)')}")
-                    if len(subs) > int(ct_resolve_limit):
-                        print(f"  {term.bullet()} {term.gray('...')} {term.gray(f'+{len(subs) - int(ct_resolve_limit)} lainnya (naikkan --ct-resolve)')}")
+                    if len(all_subs) > int(ct_resolve_limit):
+                        print(f"  {term.bullet()} {term.gray('...')} {term.gray(f'+{len(all_subs) - int(ct_resolve_limit)} lainnya (naikkan --ct-resolve)')}")
             related = _extract_hosts_from_dns_info(host, info)
             if related:
                 print(term.tag("RELATED", color="cyan") + term.dim("  ") + term.gray("NS/MX/CNAME/WWW"))
@@ -2398,6 +2827,19 @@ def run_scan(
                         for ip in ips_e:
                             resolved.append((hn, ip))
             if http_recon:
+                if web_recon:
+                    disc = web_discovery(host, timeout_s=timeout_s, delay_s=float(delay_s))
+                    paths = disc.get("paths") if isinstance(disc, dict) else None
+                    if isinstance(paths, list) and paths:
+                        print("")
+                        print(term.tag("DISCOVERY", color="cyan") + term.dim("  ") + term.gray(f"robots/sitemap/security.txt ({len(paths)} paths)"))
+                        for pth in paths[:14]:
+                            sp = str(pth or "").strip()
+                            if sp:
+                                urlp = f"https://{host}{sp}"
+                                print(f"  {term.bullet()} {term.link(_truncate_middle(urlp, 90), urlp)}")
+                        if len(paths) > 14:
+                            print(f"  {term.bullet()} {term.gray('...')} {term.gray(f'+{len(paths) - 14} lainnya')}")
                 http_data = http_probe(
                     host,
                     timeout_s=timeout_s,
@@ -2408,6 +2850,9 @@ def run_scan(
                     crawl_pages=int(crawl_pages),
                     crawl_depth=int(crawl_depth),
                     crawl_bytes=int(crawl_bytes),
+                    delay_s=float(delay_s),
+                    js_fetch_limit=4,
+                    js_fetch_bytes=300000,
                 )
                 tls_data = tls_probe(host, timeout_s=timeout_s) if tls_recon else None
                 print_http_block(host, http_data, tls_data, term)
@@ -2614,14 +3059,14 @@ def build_parser() -> argparse.ArgumentParser:
   2) Scan domain (DNS + RELATED + GeoIP + RDAP auto untuk 1 domain):
      python ip_scan.py example.com
 
-  3) Mode komplit (RDAP + CT subdomain + DNS-extra + HTTP/TLS + params + crawl + menu):
-     python ip_scan.py example.com --full --crawl --crawl-pages 30 --crawl-depth 2 --params-limit 300 --params-urls 60
+  3) Mode komplit (RDAP + subdomain + DNS-extra + web discovery + HTTP/TLS + params + crawl + menu):
+     python ip_scan.py example.com --full --crawl --crawl-pages 30 --crawl-depth 2 --params-limit 300 --params-urls 60 --delay 0.2
 
-  4) Subdomain pasif dari Certificate Transparency (CT):
-     python ip_scan.py example.com --ct --ct-limit 600 --ct-resolve 250
+  4) Subdomain pasif multi-source:
+     python ip_scan.py example.com --ct --sub-sources ct,certspotter --ct-limit 600 --ct-resolve 250
 
   5) Parameter discovery (pasif) + crawl ringan same-host:
-     python ip_scan.py example.com --params --crawl
+     python ip_scan.py example.com --params --crawl --crawl-pages 20 --crawl-depth 2 --delay 0.2
 
   6) Live map (marker real-time):
      python ip_scan.py example.com --map
@@ -2651,6 +3096,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dns", default="1.1.1.1,8.8.8.8", help="DNS server (comma-separated). Default: 1.1.1.1,8.8.8.8")
     p.add_argument("--subs-file", help="File daftar subdomain/FQDN (satu per baris) untuk ikut di-scan")
     p.add_argument("--ct", action="store_true", help="Cari subdomain secara pasif dari Certificate Transparency (crt.sh)")
+    p.add_argument("--sub-sources", default="ct,certspotter", help="Sumber subdomain pasif (comma-separated): ct, certspotter. Default: ct,certspotter")
     p.add_argument("--ct-timeout", type=float, default=12.0, help="Timeout request CT (detik)")
     p.add_argument("--ct-limit", type=int, default=250, help="Batas jumlah subdomain dari CT (default: 250)")
     p.add_argument("--ct-resolve", type=int, default=120, help="Batas subdomain CT yang di-resolve ke IP (default: 120)")
@@ -2658,6 +3104,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rdap-timeout", type=float, default=8.0, help="Timeout request RDAP (detik)")
     p.add_argument("--no-auto-rdap", action="store_true", help="Matikan auto-RDAP saat scan domain (default: aktif untuk 1 target domain)")
     p.add_argument("--dns-extra", action="store_true", help="Tambah cek DNS tambahan (DMARC/MTA-STS/TLS-RPT, dll)")
+    p.add_argument("--web", action="store_true", help="Web discovery low-impact: robots.txt, sitemap.xml, security.txt (untuk endpoint)")
     p.add_argument("--http", action="store_true", help="Tambah recon HTTP (status, redirect, headers, title)")
     p.add_argument("--params", action="store_true", help="Cari parameter pasif dari HTML/JS (query params + form/hidden fields). Otomatis mengaktifkan --http")
     p.add_argument("--params-limit", type=int, default=120, help="Batas jumlah parameter unik yang ditampilkan (default: 120)")
@@ -2666,6 +3113,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--crawl-pages", type=int, default=12, help="Batas halaman crawl (default: 12)")
     p.add_argument("--crawl-depth", type=int, default=1, help="Kedalaman crawl (default: 1)")
     p.add_argument("--crawl-bytes", type=int, default=250000, help="Batas byte per halaman crawl (default: 250000)")
+    p.add_argument("--delay", type=float, default=0.0, help="Delay antar request HTTP/crawl (detik). Default: 0")
     p.add_argument("--tls", action="store_true", help="Tambah recon TLS cert (butuh --http atau scan domain)")
     p.add_argument("--max-related", type=int, default=20, help="Batas host RELATED yang di-resolve (default: 20)")
     p.add_argument("--full", action="store_true", help="Mode komplit (rdap + ct + dns-extra + http/tls + params + crawl + menu)")
@@ -2752,6 +3200,7 @@ def main() -> int:
         rdap_on = bool(args.rdap) or full_on or auto_rdap
         menu_on = bool(args.menu) or full_on
         dns_extra_on = bool(args.dns_extra) or full_on
+        web_on = bool(args.web) or full_on
         http_on = bool(args.http) or bool(args.params) or full_on
         tls_on = bool(args.tls) or full_on
         ct_on = bool(args.ct) or (full_on and len(targets) == 1 and is_domain_like(targets[0]))
@@ -2775,6 +3224,9 @@ def main() -> int:
             crawl_pages=int(args.crawl_pages),
             crawl_depth=int(args.crawl_depth),
             crawl_bytes=int(args.crawl_bytes),
+            delay_s=float(args.delay),
+            sub_sources=str(args.sub_sources),
+            web_recon=web_on and http_on,
             dns_extra=dns_extra_on,
             max_related=int(args.max_related),
             ct_subdomains=ct_on,

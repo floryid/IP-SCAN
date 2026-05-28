@@ -284,8 +284,8 @@
               <li>
                 <span class="badge">02</span>
                 <div>
-                  <b>GeoIP + Map</b>
-                  <span>Ambil subdomain secara pasif dari Certificate Transparency (crt.sh), resolve A/AAAA, lalu ikut masuk ke SCAN.</span>
+                  <b>Subdomain (Pasif)</b>
+                  <span>Enumerasi subdomain dari sumber publik (CT/crt.sh + CertSpotter), resolve A/AAAA, lalu ikut masuk ke SCAN.</span>
                 </div>
               </li>
               <li>
@@ -306,7 +306,7 @@
                 <span class="badge">05</span>
                 <div>
                   <b>HTTP/TLS Recon</b>
-                  <span>Status/redirect, headers, title, security headers, info sertifikat TLS (SAN/validity/cipher).</span>
+                  <span>Status/redirect, headers, title, security headers, info sertifikat TLS (SAN/validity/cipher), plus deteksi WAF berbasis header/body (pasif).</span>
                 </div>
               </li>
               <li>
@@ -321,6 +321,13 @@
                 <div>
                   <b>Crawl Ringan (GET only)</b>
                   <span>Crawl same-host untuk kumpulkan lebih banyak endpoint & parameter (tanpa fuzzing, tanpa brute force, tanpa POST).</span>
+                </div>
+              </li>
+              <li>
+                <span class="badge">08</span>
+                <div>
+                  <b>Web Discovery</b>
+                  <span>Ambil endpoint low-impact dari robots.txt, sitemap.xml, dan /.well-known/security.txt untuk memperkaya mapping.</span>
                 </div>
               </li>
             </ul>
@@ -356,9 +363,9 @@ python ip_scan.py --help</pre>
                 </div>
                 <button class="copy" type="button" data-copy-btn="example">Copy</button>
               </div>
-              <pre id="example">python ip_scan.py idf.il --full --crawl --crawl-pages 30 --crawl-depth 2 --params-limit 300 --params-urls 60
-python ip_scan.py test.com --ct --ct-limit 600 --ct-resolve 250
-python ip_scan.py test.com --map
+              <pre id="example">python ip_scan.py idf.il --full --crawl --crawl-pages 30 --crawl-depth 2 --params-limit 300 --params-urls 60 --delay 0.2
+python ip_scan.py example.com --ct --sub-sources ct,certspotter --ct-limit 600 --ct-resolve 250
+python ip_scan.py example.com --map
 python ip_scan.py 8.8.8.8 --rdap</pre>
             </div>
 
